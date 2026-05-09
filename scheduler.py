@@ -1,50 +1,117 @@
+"""
+xShare Hackathon Scheduler
+Runs all three scrapers (Unstop, Devpost, HackerEarth) every 6 hours.
+Devpost + HackerEarth use requests; Unstop uses Playwright (async).
+"""
+
 import asyncio
 import sys
 sys.path.insert(0, '.')
 
 from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
-from connectors.unstop import fetch_hackathons, save_to_supabase
+
+# ── Connector imports ───────────────────────────────────────────────
+from connectors.unstop      import fetch_hackathons as unstop_fetch, save_to_supabase as unstop_save
+from connectors.devpost     import fetch_hackathons as devpost_fetch, save_to_supabase as devpost_save
+from connectors.hackerearth import fetch_hackathons as he_fetch,     save_to_supabase as he_save
 
 
-def run_scraper():
-    print(f"\n{'='*50}")
-    print(f"SCHEDULED RUN — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*50}")
+# ════════════════════════════════════════════════════════════════════
+#  INDIVIDUAL RUNNER FUNCTIONS
+# ════════════════════════════════════════════════════════════════════
 
-    async def job():
-        hackathons = await fetch_hackathons(max_pages=20)
-        print(f"Fetched: {len(hackathons)}")
-        if hackathons:
-            saved = save_to_supabase(hackathons)
-            print(f"Done! Saved {saved} new hackathons.")
-        else:
-            print("No new hackathons found.")
+def run_unstop():
+    print("\n── UNSTOP ──────────────────────────────────────")
+    try:
+        async def job():
+            hackathons = await unstop_fetch(max_pages=20)
+            print(f"  Fetched: {len(hackathons)}")
+            return unstop_save(hackathons) if hackathons else 0
+        saved = asyncio.run(job())
+        print(f"  ✅ Unstop done — {saved} new records")
+        return saved
+    except Exception as e:
+        print(f"  ❌ Unstop failed: {e}")
+        return 0
 
-    asyncio.run(job())
 
+def run_devpost():
+    print("\n── DEVPOST ─────────────────────────────────────")
+    try:
+        hackathons = devpost_fetch(max_pages=60)
+        print(f"  Fetched: {len(hackathons)}")
+        saved = devpost_save(hackathons) if hackathons else 0
+        print(f"  ✅ Devpost done — {saved} new records")
+        return saved
+    except Exception as e:
+        print(f"  ❌ Devpost failed: {e}")
+        return 0
+
+
+def run_hackerearth():
+    print("\n── HACKEREARTH ─────────────────────────────────")
+    try:
+        hackathons = he_fetch()
+        print(f"  Fetched: {len(hackathons)}")
+        saved = he_save(hackathons) if hackathons else 0
+        print(f"  ✅ HackerEarth done — {saved} new records")
+        return saved
+    except Exception as e:
+        print(f"  ❌ HackerEarth failed: {e}")
+        return 0
+
+
+# ════════════════════════════════════════════════════════════════════
+#  MASTER JOB — called by scheduler every 6 hours
+# ════════════════════════════════════════════════════════════════════
+
+def run_all_scrapers():
+    start = datetime.now()
+    print(f"\n{'='*52}")
+    print(f"  SCHEDULED RUN — {start.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*52}")
+
+    total_saved = 0
+    total_saved += run_unstop()
+    total_saved += run_devpost()
+    total_saved += run_hackerearth()
+
+    elapsed = (datetime.now() - start).seconds
+    print(f"\n{'='*52}")
+    print(f"  DONE — {total_saved} new hackathons saved in {elapsed}s")
+    print(f"  Next run in 6 hours.")
+    print(f"{'='*52}\n")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("XSHARE HACKATHON SCHEDULER")
-    print("=" * 50)
-    print("Runs every Monday at 8:00 AM automatically")
-    print("Running once now on startup...\n")
+    print("=" * 52)
+    print("  XSHARE HACKATHON SCHEDULER")
+    print("  Sources: Unstop · Devpost · HackerEarth")
+    print("  Schedule: every 6 hours")
+    print("=" * 52)
+    print("\nRunning all scrapers now on startup...\n")
 
-    # Run immediately on startup
-    run_scraper()
+    # Run once immediately so Railway doesn't sit idle on first deploy
+    run_all_scrapers()
 
-    # Schedule daily at 8 AM
+    # Schedule every 6 hours
     scheduler = BlockingScheduler(timezone="Asia/Kolkata")
     scheduler.add_job(
-        run_scraper,
-        CronTrigger(day_of_week="mon",hour=8, minute=0),
-        id="unstop_daily",
-        name="Daily Unstop Scraper"
+        run_all_scrapers,
+        IntervalTrigger(hours=6),
+        id="all_scrapers_6h",
+        name="All Scrapers — Every 6 Hours",
+        max_instances=1,          # never overlap two runs
+        coalesce=True,            # skip missed fires (e.g. after a restart)
     )
 
-    print("\nScheduler armed. Next run: Monday 8:00 AM IST")
+    print("Scheduler armed — running every 6 hours.")
     print("Press Ctrl+C to stop.\n")
 
     try:
