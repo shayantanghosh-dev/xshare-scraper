@@ -1,10 +1,9 @@
-FROM python:3.12-slim
+FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt
-RUN playwright install chromium --with-deps
 
 COPY . .
 
