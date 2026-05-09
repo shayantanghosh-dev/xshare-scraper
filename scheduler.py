@@ -29,7 +29,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("XSHARE HACKATHON SCHEDULER")
     print("=" * 50)
-    print("Runs daily at 8:00 AM automatically")
+    print("Runs every Monday at 8:00 AM automatically")
     print("Running once now on startup...\n")
 
     # Run immediately on startup
@@ -39,12 +39,12 @@ if __name__ == "__main__":
     scheduler = BlockingScheduler(timezone="Asia/Kolkata")
     scheduler.add_job(
         run_scraper,
-        CronTrigger(hour=8, minute=0),
+        CronTrigger(day_of_week="mon",hour=8, minute=0),
         id="unstop_daily",
         name="Daily Unstop Scraper"
     )
 
-    print("\nScheduler armed. Next run: tomorrow 8:00 AM IST")
+    print("\nScheduler armed. Next run: Monday 8:00 AM IST")
     print("Press Ctrl+C to stop.\n")
 
     try:
