@@ -2,55 +2,67 @@ import requests
 import re
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.supabase_client import supabase
 
 SOURCE = "devpost"
-BATCH_SIZE = 500  # Supabase safe insert limit
+BATCH_SIZE = 500
 
 
 def clean_prize(prize_html):
     """Strip HTML tags from prize amount."""
     clean = re.sub(r'<[^>]+>', '', prize_html).strip()
     if not clean or re.fullmatch(r'[\$£€₹][\w\s]*0', clean):
-        return "Certificates/Others"
+        return "Prizes available"
     return clean
 
 
-def parse_deadline(period_str):
+def parse_end_date(period_str):
     """
-    Convert Devpost date strings like 'Apr 11 - Jun 19, 2026' → 'YYYY-MM-DD'.
-    Always extracts the END date.
+    Extract the END date from a Devpost date range like 'Apr 11 - Jun 19, 2026'.
+    Returns a date object or None.
     """
     if not period_str:
-        return ""
+        return None
     period_str = period_str.replace("–", "-").strip()
     end_part = period_str.split(" - ", 1)[-1].strip()
     for fmt in ("%b %d, %Y", "%B %d, %Y", "%b %Y"):
         try:
-            return datetime.strptime(end_part, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(end_part, fmt).date()
         except ValueError:
             continue
-    return end_part  # return raw if unparseable
+    return None
 
 
-def normalize_mode(location):
-    """Map raw Devpost location string to 'online' or 'offline'."""
+def compute_days_left(end_date):
+    """Return a human-readable days-left string."""
+    if not end_date:
+        return "Unknown"
+    delta = (end_date - date.today()).days
+    if delta < 0:
+        return "Ended"
+    if delta == 0:
+        return "Ends today"
+    return f"{delta} days left"
+
+
+def normalize_location(location):
+    """
+    Return (location_str, is_online) tuple.
+    Online/virtual → ("Online", True); else keep city name and mark offline.
+    """
     if not location:
-        return "online"
-    loc = location.lower().strip()
-    if loc in ("online", "virtual", "remote", "anywhere", ""):
-        return "online"
-    return "offline"  # city names, country names = in-person
+        return "Online", True
+    loc = location.strip()
+    if loc.lower() in ("online", "virtual", "remote", "anywhere", ""):
+        return "Online", True
+    return loc, False
 
 
 def fetch_hackathons(max_pages=60):
-    """
-    Fetch open + upcoming hackathons from Devpost API.
-    Previously only fetched 'open' (~63). Now fetches both statuses (~1300+).
-    """
+    """Fetch open + upcoming hackathons from Devpost API."""
     all_hackathons = []
 
     headers = {
@@ -103,11 +115,6 @@ def fetch_hackathons(max_pages=60):
 
 
 def save_to_supabase(hackathons):
-    """
-    Batch-deduplication: one query to load all existing URLs,
-    then bulk-insert only new records in chunks of BATCH_SIZE.
-    Avoids the old N×SELECT pattern (was 2600+ queries for devpost).
-    """
     if not hackathons:
         return 0
 
@@ -117,29 +124,43 @@ def save_to_supabase(hackathons):
         url = h.get("url", "")
         if not url:
             continue
-        location = h.get("displayed_location", {}).get("location", "")
+
+        raw_location = h.get("displayed_location", {}).get("location", "")
+        location_str, is_online = normalize_location(raw_location)
+
+        dates_str = h.get("submission_period_dates", "").replace("–", "-").strip()
+        end_date = parse_end_date(dates_str)
+
+        participants_raw = h.get("registrations_count", 0) or 0
+        participants_str = f"{participants_raw:,}" if participants_raw else "0"
+
+        themes = [
+            t.get("name", "") for t in h.get("themes", []) if t.get("name")
+        ]
+
         records.append({
-            "title":      h.get("title", "").strip(),
-            "organizer":  h.get("organization_name", "").strip(),
-            "deadline":   parse_deadline(h.get("submission_period_dates", "")),
-            "prize":      clean_prize(h.get("prize_amount", "")),
-            "mode":       normalize_mode(location),
-            "tags":       ", ".join(t.get("name", "") for t in h.get("themes", [])),
-            "source_url": url,
-            "source":     SOURCE,
-            "image_url":  h.get("thumbnail_url", ""),
-            "status":     "pending",
+            "source":       SOURCE,
+            "title":        h.get("title", "").strip(),
+            "url":          url,
+            "tagline":      (h.get("tagline") or h.get("description") or "").strip(),
+            "dates":        dates_str,
+            "prize":        clean_prize(h.get("prize_amount", "")),
+            "participants": participants_str,
+            "location":     location_str,
+            "themes":       themes,
+            "isOnline":     is_online,
+            "daysLeft":     compute_days_left(end_date),
         })
 
-    # ── 2. Fetch all existing source_urls in ONE query ────────────────
-    existing_result = supabase.table("hackathons")\
-        .select("source_url")\
-        .eq("source", SOURCE)\
+    # ── 2. Fetch all existing URLs in ONE query ───────────────────────
+    existing_result = supabase.table("hackathons") \
+        .select("url") \
+        .eq("source", SOURCE) \
         .execute()
-    existing_urls = {r["source_url"] for r in (existing_result.data or [])}
+    existing_urls = {r["url"] for r in (existing_result.data or [])}
 
     # ── 3. Filter to only new records ─────────────────────────────────
-    new_records = [r for r in records if r["source_url"] not in existing_urls]
+    new_records = [r for r in records if r["url"] not in existing_urls]
     skipped = len(records) - len(new_records)
     print(f"  New: {len(new_records)} | Duplicates skipped: {skipped}")
 
