@@ -1,23 +1,48 @@
 import requests
 import sys
 import os
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.supabase_client import supabase
 
-SOURCE = "hackerearth"
+SOURCE     = "hackerearth"
 BATCH_SIZE = 500
 
 
-def parse_deadline(end_str):
-    """Normalize HackerEarth ISO datetimes to YYYY-MM-DD."""
-    if not end_str:
-        return ""
+def parse_date(date_str):
+    """Normalize HackerEarth ISO datetimes → date object."""
+    if not date_str:
+        return None
     try:
-        return datetime.fromisoformat(end_str).strftime("%Y-%m-%d")
+        return datetime.fromisoformat(date_str).date()
     except ValueError:
-        return end_str
+        return None
+
+
+def format_date_range(start_str, end_str):
+    """Build a human-readable date range like 'May 1 - May 20, 2026'."""
+    start = parse_date(start_str)
+    end   = parse_date(end_str)
+    if start and end:
+        if start.year == end.year:
+            return f"{start.strftime('%b')} {start.day} - {end.strftime('%b')} {end.day}, {end.year}"
+        return f"{start.strftime('%b')} {start.day}, {start.year} - {end.strftime('%b')} {end.day}, {end.year}"
+    if end:
+        return f"{end.strftime('%b')} {end.day}, {end.year}"
+    return ""
+
+
+def compute_days_left(end_date):
+    """Return a human-readable days-left string."""
+    if not end_date:
+        return "Unknown"
+    delta = (end_date - date.today()).days
+    if delta < 0:
+        return "Ended"
+    if delta == 0:
+        return "Ends today"
+    return f"{delta} days left"
 
 
 def fetch_hackathons():
@@ -42,12 +67,12 @@ def fetch_hackathons():
         print(f"  ⚠ Request failed: {e}")
         return []
 
-    data = response.json()
+    data       = response.json()
     challenges = data.get("data", [])
-    total = data.get("total", 0)
+    total      = data.get("total", 0)
     print(f"  Total challenges from API: {total}")
 
-    now = datetime.now(timezone.utc)
+    now    = datetime.now(timezone.utc)
     result = []
 
     for c in challenges:
@@ -55,13 +80,13 @@ def fetch_hackathons():
             continue
         end_str = c.get("end", "")
         try:
-            end_date = datetime.fromisoformat(end_str)
-            if end_date.tzinfo is None:
-                end_date = end_date.replace(tzinfo=timezone.utc)
-            if end_date < now:
-                continue  # skip expired
+            end_dt = datetime.fromisoformat(end_str)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            if end_dt < now:
+                continue
         except (ValueError, TypeError):
-            pass  # include if date is unparseable
+            pass
         result.append(c)
 
     print(f"  Upcoming/live hackathons: {len(result)}")
@@ -69,10 +94,6 @@ def fetch_hackathons():
 
 
 def save_to_supabase(hackathons):
-    """
-    Batch-deduplication: one query to load all existing URLs,
-    then bulk-insert only new records.
-    """
     if not hackathons:
         return 0
 
@@ -84,28 +105,41 @@ def save_to_supabase(hackathons):
             url = f"https://www.hackerearth.com{url}"
         if not url:
             continue
+
+        start_str = h.get("start", "")
+        end_str   = h.get("end", "")
+        end_date  = parse_date(end_str)
+
+        # HackerEarth challenges are always online
+        # Tags come from challenge type + any sub-type
+        themes = [t for t in [h.get("type"), h.get("challenge_type")] if t]
+
+        participants_raw = h.get("registrations_count") or h.get("total_participants") or 0
+        participants = f"{int(participants_raw):,}" if participants_raw else "0"
+
         records.append({
-            "title":      h.get("title", "").strip(),
-            "organizer":  h.get("company_name", "").strip(),
-            "deadline":   parse_deadline(h.get("end", "")),
-            "prize":      "See HackerEarth",
-            "mode":       "online",
-            "tags":       h.get("type", "Hackathon"),
-            "source_url": url,
-            "source":     SOURCE,
-            "image_url":  h.get("listing_image", ""),
-            "status":     "pending",
+            "source":       SOURCE,
+            "title":        h.get("title", "").strip(),
+            "url":          url,
+            "tagline":      (h.get("description") or h.get("short_description") or "").strip(),
+            "dates":        format_date_range(start_str, end_str),
+            "prize":        "See HackerEarth",
+            "participants": participants,
+            "location":     "Online",
+            "themes":       themes,
+            "isOnline":     True,
+            "daysLeft":     compute_days_left(end_date),
         })
 
-    # ── 2. Fetch all existing source_urls in ONE query ────────────────
-    existing_result = supabase.table("hackathons")\
-        .select("source_url")\
-        .eq("source", SOURCE)\
+    # ── 2. Fetch all existing URLs in ONE query ───────────────────────
+    existing_result = supabase.table("hackathons") \
+        .select("url") \
+        .eq("source", SOURCE) \
         .execute()
-    existing_urls = {r["source_url"] for r in (existing_result.data or [])}
+    existing_urls = {r["url"] for r in (existing_result.data or [])}
 
     # ── 3. Filter to only new records ─────────────────────────────────
-    new_records = [r for r in records if r["source_url"] not in existing_urls]
+    new_records = [r for r in records if r["url"] not in existing_urls]
     skipped = len(records) - len(new_records)
     print(f"  New: {len(new_records)} | Duplicates skipped: {skipped}")
 
