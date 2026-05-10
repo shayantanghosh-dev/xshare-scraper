@@ -1,24 +1,20 @@
 """
-Devfolio scraper — Next.js site, data is in window.__NEXT_DATA__.
-Strategy:
-  1. Load the page with Playwright
-  2. Pull hackathon data from window.__NEXT_DATA__ (fastest)
-  3. If that's empty, fall back to scraping DOM card elements directly
-  4. Scroll to trigger infinite-scroll pagination
-  5. Runs on both /open and /upcoming tabs
+Devfolio scraper — two-phase approach:
+  Phase 1: Load listing pages (/open, /upcoming), scroll to collect all hackathon URLs
+  Phase 2: Visit each hackathon's own page, extract full details from __NEXT_DATA__
 """
 
 import asyncio
 import sys
 import os
 import json
-from datetime import datetime, timezone
+from datetime import datetime, date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.supabase_client import supabase
 from playwright.async_api import async_playwright
 
-SOURCE = "devfolio"
+SOURCE     = "devfolio"
 BATCH_SIZE = 500
 
 
@@ -26,189 +22,239 @@ BATCH_SIZE = 500
 #  HELPERS
 # ════════════════════════════════════════════════════════════════════
 
-def parse_deadline(date_str):
-    """Handle ISO datetimes and DD/MM/YY card format."""
+def parse_date(date_str):
+    """Normalize any date format → date object."""
     if not date_str:
-        return ""
-    s = str(date_str)
-    # ISO format: 2026-07-25T00:00:00Z
+        return None
+    s = str(date_str).strip()
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+        "%d/%m/%y",
+        "%d/%m/%Y",
+    ):
+        try:
+            return datetime.strptime(s.replace("Z", ""), fmt.replace("%z", "")).date()
+        except ValueError:
+            continue
     try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d")
-    except (ValueError, AttributeError):
-        pass
-    # Card format: "25/07/26"
-    try:
-        dt = datetime.strptime(s, "%d/%m/%y")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-    return s
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+    except Exception:
+        return None
 
 
-def normalize_mode(raw):
+def format_date_range(start_str, end_str):
+    """Build a human-readable date range like 'May 1 - May 20, 2026'."""
+    start = parse_date(start_str)
+    end   = parse_date(end_str)
+    if start and end:
+        if start.year == end.year:
+            return f"{start.strftime('%b')} {start.day} - {end.strftime('%b')} {end.day}, {end.year}"
+        return f"{start.strftime('%b')} {start.day}, {start.year} - {end.strftime('%b')} {end.day}, {end.year}"
+    if end:
+        return f"{end.strftime('%b')} {end.day}, {end.year}"
+    return ""
+
+
+def compute_days_left(end_date):
+    """Return a human-readable days-left string."""
+    if not end_date:
+        return "Unknown"
+    delta = (end_date - date.today()).days
+    if delta < 0:
+        return "Ended"
+    if delta == 0:
+        return "Ends today"
+    return f"{delta} days left"
+
+
+def normalize_location(raw):
+    """Return (location_str, is_online)."""
     if not raw:
-        return "online"
-    r = raw.lower()
+        return "Online", True
+    r = str(raw).lower()
     if "offline" in r or "in-person" in r or "onsite" in r:
-        return "offline"
-    return "online"
-
-
-def build_record_from_api(h):
-    """Build DB record from a __NEXT_DATA__ hackathon object."""
-    slug = h.get("slug", "")
-    url = f"https://{slug}.devfolio.co" if slug else ""
-
-    themes = h.get("themes") or []
-    tags = ", ".join(
-        (t.get("name", "") if isinstance(t, dict) else str(t)) for t in themes
-    )
-
-    prize_pool = h.get("prize_pool") or h.get("prize_amount") or 0
-    try:
-        prize = f"${int(prize_pool):,}" if int(prize_pool) > 0 else "Certificates/Others"
-    except (ValueError, TypeError):
-        prize = "Certificates/Others"
-
-    setting = h.get("hackathon_setting") or {}
-    mode = normalize_mode(
-        setting.get("hackathon_mode") or h.get("mode") or h.get("hackathon_type") or ""
-    )
-
-    cover = (
-        h.get("cover_image_url") or h.get("banner_image_url") or
-        h.get("logo_url") or h.get("favicon") or ""
-    )
-
-    org = h.get("organization") or {}
-    organizer = org.get("name", "") if isinstance(org, dict) else h.get("org_name", "")
-
-    return {
-        "title":      (h.get("title") or h.get("name") or "").strip(),
-        "organizer":  organizer,
-        "deadline":   parse_deadline(h.get("ends_at") or h.get("end_date") or ""),
-        "prize":      prize,
-        "mode":       mode,
-        "tags":       tags,
-        "source_url": url,
-        "source":     SOURCE,
-        "image_url":  cover,
-        "status":     "pending",
-    }
-
-
-def build_record_from_dom(card):
-    """Build DB record from a DOM-scraped card dict."""
-    return {
-        "title":      card.get("title", "").strip(),
-        "organizer":  card.get("organizer", ""),
-        "deadline":   parse_deadline(card.get("deadline", "")),
-        "prize":      "See Devfolio",
-        "mode":       normalize_mode(card.get("mode", "")),
-        "tags":       card.get("tags", ""),
-        "source_url": card.get("url", ""),
-        "source":     SOURCE,
-        "image_url":  "",
-        "status":     "pending",
-    }
+        return raw.strip(), False
+    return "Online", True
 
 
 # ════════════════════════════════════════════════════════════════════
-#  STRATEGY 1 — window.__NEXT_DATA__
+#  PHASE 1 — collect hackathon URLs from listing pages
 # ════════════════════════════════════════════════════════════════════
 
-async def extract_next_data(page):
-    """Walk the Next.js embedded JSON to find hackathon arrays."""
-    try:
-        raw = await page.evaluate("() => JSON.stringify(window.__NEXT_DATA__ || {})")
-        data = json.loads(raw)
-        page_props = data.get("props", {}).get("pageProps", {})
+async def collect_urls(page, max_scrolls=30):
+    urls = set()
 
-        found = []
+    for tab in ["https://devfolio.co/hackathons/open",
+                "https://devfolio.co/hackathons/upcoming"]:
+        print(f"\n  Phase 1 — {tab}")
+        try:
+            await page.goto(tab, wait_until="networkidle", timeout=35000)
+        except Exception:
+            try:
+                await page.goto(tab, wait_until="domcontentloaded", timeout=35000)
+            except Exception as e:
+                print(f"  ⚠ Could not load {tab}: {e}")
+                continue
 
-        def walk(obj, depth=0):
-            """Recursively find any list that looks like hackathons."""
-            if depth > 6:
-                return
-            if isinstance(obj, list):
-                for item in obj:
-                    if isinstance(item, dict) and ("slug" in item or "title" in item):
-                        found.append(item)
-            elif isinstance(obj, dict):
-                for v in obj.values():
-                    walk(v, depth + 1)
+        await page.wait_for_timeout(3000)
+        stable = prev = 0
 
-        walk(page_props)
-        return found
-
-    except Exception as e:
-        print(f"  __NEXT_DATA__ error: {e}")
-        return []
-
-
-# ════════════════════════════════════════════════════════════════════
-#  STRATEGY 2 — DOM card scraping
-# ════════════════════════════════════════════════════════════════════
-
-async def scrape_dom_cards(page):
-    """
-    Devfolio renders hackathon cards as anchor elements.
-    Extract title, URL, mode, start date from visible card text.
-    """
-    try:
-        cards = await page.evaluate("""
-        () => {
-            const results = [];
-            const seen = new Set();
-
-            document.querySelectorAll('a[href]').forEach(a => {
-                const href = a.href || '';
-                // Only devfolio subdomain links (actual hackathon pages)
-                if (!href.match(/https:\\/\\/[a-z0-9-]+\\.devfolio\\.co/)) return;
-                if (seen.has(href)) return;
-                seen.add(href);
-
-                const text = a.innerText || '';
-                const lines = text.split('\\n').map(l => l.trim()).filter(Boolean);
-                if (lines.length < 1 || !lines[0]) return;
-
-                // Mode
-                const modeMatch = text.match(/\\b(OFFLINE|ONLINE)\\b/i);
-
-                // Date shown on card e.g. "STARTS 25/07/26" or "LIVE"
-                const dateMatch = text.match(/STARTS\\s+(\\d{2}\\/\\d{2}\\/\\d{2})/i);
-
-                // Tags
-                const tagMatch = text.match(/(NO RESTRICTIONS|AI\\/ML|FINTECH|BLOCKCHAIN|WEB3|HEALTH|EDU|GAMING)/i);
-
-                results.push({
-                    title:    lines[0],
-                    url:      href,
-                    mode:     modeMatch ? modeMatch[1] : '',
-                    deadline: dateMatch ? dateMatch[1] : '',
-                    tags:     tagMatch  ? tagMatch[1]  : '',
-                    organizer: '',
+        for i in range(max_scrolls + 1):
+            found = await page.evaluate("""
+            () => {
+                const hrefs = new Set();
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const h = a.href || '';
+                    if (/^https:\\/\\/[a-z0-9-]+\\.devfolio\\.co\\/?$/.test(h)) {
+                        hrefs.add(h.replace(/\\/$/, ''));
+                    }
                 });
-            });
+                return [...hrefs];
+            }
+            """)
 
-            return results;
+            for u in found:
+                urls.add(u)
+
+            print(f"    Scroll {i}: {len(urls)} unique URLs so far")
+
+            if len(urls) == prev:
+                stable += 1
+                if stable >= 3:
+                    print(f"    Stable — done with this tab.")
+                    break
+            else:
+                stable = 0
+                prev = len(urls)
+
+            if i < max_scrolls:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(2000)
+
+    return list(urls)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  PHASE 2 — visit each hackathon page, extract __NEXT_DATA__
+# ════════════════════════════════════════════════════════════════════
+
+async def extract_details(page, url):
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        await page.wait_for_timeout(1500)
+
+        raw  = await page.evaluate("() => JSON.stringify(window.__NEXT_DATA__ || {})")
+        data = json.loads(raw)
+        pp   = data.get("props", {}).get("pageProps", {})
+
+        h = (
+            pp.get("hackathon") or
+            pp.get("data") or
+            pp.get("hackathonData") or
+            {}
+        )
+        if not h:
+            for v in pp.values():
+                if isinstance(v, dict) and ("slug" in v or "title" in v or "ends_at" in v):
+                    h = v
+                    break
+
+        # ── Title ─────────────────────────────────────────────────
+        title = (h.get("title") or h.get("name") or "").strip()
+        if not title:
+            title = await page.evaluate("""
+            () => {
+                const og = document.querySelector('meta[property="og:title"]');
+                return og ? og.content : document.title || '';
+            }
+            """) or ""
+            title = title.replace(" | Devfolio", "").strip()
+        if not title:
+            return None
+
+        # ── Tagline ───────────────────────────────────────────────
+        tagline = (
+            h.get("tagline") or h.get("short_description") or h.get("description") or ""
+        ).strip()
+        # Fall back to og:description
+        if not tagline:
+            tagline = await page.evaluate("""
+            () => {
+                const m = document.querySelector('meta[name="description"], meta[property="og:description"]');
+                return m ? m.content : '';
+            }
+            """) or ""
+        tagline = tagline.strip()
+
+        # ── Dates ─────────────────────────────────────────────────
+        starts_at = h.get("starts_at") or h.get("start_date") or ""
+        ends_at   = h.get("ends_at")   or h.get("end_date")   or h.get("submission_deadline") or ""
+        dates_str = format_date_range(starts_at, ends_at)
+        end_date  = parse_date(ends_at)
+
+        # ── Prize ─────────────────────────────────────────────────
+        prize_raw = h.get("prize_pool") or h.get("prize_amount") or h.get("total_prizes") or 0
+        try:
+            prize = f"${int(prize_raw):,} in prizes" if int(prize_raw) > 0 else "Prizes available"
+        except (ValueError, TypeError):
+            prize_str = str(prize_raw).strip()
+            prize = prize_str if prize_str else "Prizes available"
+
+        # ── Participants ──────────────────────────────────────────
+        participants_raw = (
+            h.get("registrations_count") or
+            h.get("participants_count") or
+            h.get("total_registrations") or 0
+        )
+        participants = f"{int(participants_raw):,}" if participants_raw else "0"
+
+        # ── Themes / Tags ─────────────────────────────────────────
+        themes_raw = h.get("themes") or h.get("tags") or h.get("categories") or []
+        if isinstance(themes_raw, list):
+            themes = [
+                (t.get("name", "") if isinstance(t, dict) else str(t))
+                for t in themes_raw if t
+            ]
+        else:
+            themes = [str(themes_raw)] if themes_raw else []
+
+        # ── Location ──────────────────────────────────────────────
+        setting  = h.get("hackathon_setting") or {}
+        mode_raw = (
+            setting.get("hackathon_mode") or
+            h.get("mode") or
+            h.get("hackathon_type") or ""
+        )
+        location_str, is_online = normalize_location(mode_raw)
+
+        return {
+            "source":       SOURCE,
+            "title":        title,
+            "url":          url,
+            "tagline":      tagline,
+            "dates":        dates_str,
+            "prize":        prize,
+            "participants": participants,
+            "location":     location_str,
+            "themes":       themes,
+            "isOnline":     is_online,
+            "daysLeft":     compute_days_left(end_date),
         }
-        """)
-        return cards or []
+
     except Exception as e:
-        print(f"  DOM scrape error: {e}")
-        return []
+        print(f"  ⚠ Error on {url}: {e}")
+        return None
 
 
 # ════════════════════════════════════════════════════════════════════
-#  FETCH
+#  MAIN FETCH
 # ════════════════════════════════════════════════════════════════════
 
-async def fetch_hackathons(max_scrolls=25):
-    all_items = []   # list of ("api"|"dom", dict)
-    seen_ids = set()
-
+async def fetch_hackathons(max_scrolls=30):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -220,86 +266,43 @@ async def fetch_hackathons(max_scrolls=25):
         )
         page = await context.new_page()
 
-        for tab_url in [
-            "https://devfolio.co/hackathons/open",
-            "https://devfolio.co/hackathons/upcoming",
-        ]:
-            print(f"\n  ── Loading {tab_url}")
-            try:
-                await page.goto(tab_url, wait_until="networkidle", timeout=35000)
-            except Exception:
-                try:
-                    await page.goto(tab_url, wait_until="domcontentloaded", timeout=35000)
-                except Exception as e:
-                    print(f"  ⚠ Could not load {tab_url}: {e}")
-                    continue
-            await page.wait_for_timeout(3000)
+        print("=" * 50)
+        print("Phase 1: Collecting hackathon URLs...")
+        urls = await collect_urls(page, max_scrolls=max_scrolls)
+        print(f"\n  Found {len(urls)} unique hackathon URLs")
 
-            stable = 0
-            prev = len(all_items)
-
-            for i in range(max_scrolls + 1):   # +1 so we scan before first scroll too
-                # Try __NEXT_DATA__
-                next_items = await extract_next_data(page)
-                for h in next_items:
-                    uid = h.get("slug") or h.get("id") or h.get("title", "")
-                    if uid and uid not in seen_ids:
-                        seen_ids.add(uid)
-                        all_items.append(("api", h))
-
-                # Try DOM cards
-                dom_items = await scrape_dom_cards(page)
-                for c in dom_items:
-                    uid = c.get("url", "")
-                    if uid and uid not in seen_ids:
-                        seen_ids.add(uid)
-                        all_items.append(("dom", c))
-
-                print(f"  Scroll {i}: total captured = {len(all_items)}")
-
-                # Stop scrolling if no progress
-                if len(all_items) == prev:
-                    stable += 1
-                    if stable >= 3:
-                        print(f"  Stable for 3 rounds — done with this tab.")
-                        break
-                else:
-                    stable = 0
-                    prev = len(all_items)
-
-                if i < max_scrolls:
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(2500)
+        print("\nPhase 2: Extracting details from each page...")
+        records = []
+        for i, url in enumerate(urls, 1):
+            print(f"  [{i}/{len(urls)}] {url}")
+            rec = await extract_details(page, url)
+            if rec:
+                records.append(rec)
+                print(f"    ✓ {rec['title']} | {rec['dates']} | {rec['prize']} | {rec['daysLeft']}")
+            else:
+                print(f"    ✗ Skipped (no data)")
 
         await browser.close()
 
-    return all_items
+    return records
 
 
 # ════════════════════════════════════════════════════════════════════
 #  SAVE
 # ════════════════════════════════════════════════════════════════════
 
-def save_to_supabase(raw_items):
-    if not raw_items:
+def save_to_supabase(records):
+    if not records:
         return 0
 
-    records = []
-    for source_type, item in raw_items:
-        try:
-            rec = build_record_from_api(item) if source_type == "api" else build_record_from_dom(item)
-            if rec["source_url"] and rec["title"]:
-                records.append(rec)
-        except Exception as e:
-            print(f"  ⚠ Record error: {e}")
+    records = [r for r in records if r.get("url") and r.get("title")]
 
-    # Batch dedup
-    existing = supabase.table("hackathons")\
-        .select("source_url").eq("source", SOURCE).execute()
-    existing_urls = {r["source_url"] for r in (existing.data or [])}
+    existing = supabase.table("hackathons") \
+        .select("url").eq("source", SOURCE).execute()
+    existing_urls = {r["url"] for r in (existing.data or [])}
 
-    new_records = [r for r in records if r["source_url"] not in existing_urls]
-    print(f"  New: {len(new_records)} | Skipped: {len(records) - len(new_records)}")
+    new_records = [r for r in records if r["url"] not in existing_urls]
+    print(f"\n  New: {len(new_records)} | Duplicates skipped: {len(records) - len(new_records)}")
 
     saved = 0
     for i in range(0, len(new_records), BATCH_SIZE):
@@ -307,7 +310,7 @@ def save_to_supabase(raw_items):
         try:
             supabase.table("hackathons").insert(chunk).execute()
             saved += len(chunk)
-            print(f"  ✓ Batch {i // BATCH_SIZE + 1}: {len(chunk)} records inserted")
+            print(f"  ✓ Batch {i // BATCH_SIZE + 1}: {len(chunk)} inserted")
         except Exception as e:
             print(f"  ✗ Batch error: {e}")
 
@@ -322,10 +325,10 @@ if __name__ == "__main__":
     print("=" * 50)
     print("DEVFOLIO SCRAPER")
     print("=" * 50)
-    items = asyncio.run(fetch_hackathons(max_scrolls=25))
-    print(f"\nTotal captured: {len(items)}")
-    if items:
-        saved = save_to_supabase(items)
+    records = asyncio.run(fetch_hackathons(max_scrolls=30))
+    print(f"\nTotal with full details: {len(records)}")
+    if records:
+        saved = save_to_supabase(records)
         print(f"\n✅ Done — {saved} new hackathons saved.")
     else:
-        print("❌ No hackathons captured — check Railway logs.")
+        print("❌ No hackathons extracted.")
