@@ -1,0 +1,20 @@
+# xShare Master Scraper — Python dependencies
+# Install with: pip install -r requirements.txt
+# Then install browser: playwright install chromium
+
+# Scraping
+playwright>=1.40.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Data
+pandas>=2.0.0
+
+# Supabase
+supabase>=2.0.0
+
+# Scheduler
+APScheduler>=3.10.0
+
+# Env
+python-dotenv>=1.0.0

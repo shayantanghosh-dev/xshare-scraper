@@ -1,0 +1,22 @@
+# Never bake secrets into the image — set these in Railway → Variables
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Dev/test artifacts
+*.csv
+*.log
+.pytest_cache/
+
+# Git
+.git/
+.gitignore
+
+# Node (if website lives in same repo)
+node_modules/
+dist/
