@@ -22,10 +22,22 @@ Single entry point — runs all 6 scrapers every 6 hours.
 """
 
 import asyncio
+import logging
 import os
 import sys
 import traceback
 from datetime import datetime, timezone
+
+# ── Force all output to stdout so Railway streams it in real time ──────────────
+# Without this, Python buffers output and Railway shows nothing until the process ends.
+sys.stdout.reconfigure(line_buffering=True)
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -105,10 +117,7 @@ def _cleanup(table: str, source: str, current_urls: set) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _upsert_and_clean_devfolio(records: list) -> tuple:
-    """
-    Full UPSERT + cleanup for Devfolio.
-    Returns (new, updated, deleted).
-    """
+    """Full UPSERT + cleanup for Devfolio. Returns (new, updated, deleted)."""
     records = [r for r in records if r.get("url")]
     if not records:
         print("    ⚠  No valid records to save.")
@@ -157,10 +166,7 @@ def _upsert_and_clean_devfolio(records: list) -> tuple:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _upsert_scholarships(df: pd.DataFrame) -> tuple:
-    """
-    Full UPSERT + cleanup for scholarships.
-    Returns (new, updated, deleted).
-    """
+    """Full UPSERT + cleanup for scholarships. Returns (new, updated, deleted)."""
     if df is None or df.empty:
         print("    ⚠  No scholarship data to save.")
         return 0, 0, 0
@@ -269,7 +275,6 @@ def _run_hackerearth() -> tuple:
     if not data:
         return 0, 0, 0
     saved = he_save(data)
-    # Replicate the same URL normalisation the connector uses
     current = set()
     for h in data:
         url = h.get("url", "")
@@ -285,7 +290,7 @@ def _run_hackerearth() -> tuple:
 def _run_unstop_internships() -> tuple:
     # Same as Unstop hackathons — raw items use `seo_url`.
     async def job():
-        data = await unstop_intern_fetch(max_pages=50)  # 567 total / 18 per page = 32 pages; 50 gives headroom
+        data = await unstop_intern_fetch(max_pages=50)
         if not data:
             return 0, 0, 0
         saved   = unstop_intern_save(data)
