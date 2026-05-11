@@ -28,12 +28,8 @@ from email.utils import parsedate_to_datetime
 
 import feedparser
 from bs4 import BeautifulSoup
-import anthropic
 
 logger = logging.getLogger(__name__)
-
-# ── Anthropic client ────────────────────────────────────────────────────────────
-_anthropic = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 # ── RSS sources: (display_name, source_key, feed_url, articles_to_pull) ────────
 RSS_SOURCES = [
@@ -115,27 +111,12 @@ def _categorise(title: str, source_key: str) -> str:
 
 
 def _summarise(title: str, body: str, source: str) -> str:
-    """Call Claude Haiku to produce a ~50-word factual summary."""
-    context = f"Source: {source}\nTitle: {title}\n\n{body}" if body else f"Source: {source}\nTitle: {title}"
-    try:
-        msg = _anthropic.messages.create(
-            model      = "claude-haiku-4-5-20251001",
-            max_tokens = 130,
-            messages   = [{
-                "role":    "user",
-                "content": (
-                    "Summarise this tech news article in exactly 50 words. "
-                    "Be factual, informative and neutral. "
-                    "No bullet points. Plain prose only. "
-                    "Do not start with 'This article' or 'The article'.\n\n"
-                    f"{context}"
-                ),
-            }],
-        )
-        return msg.content[0].text.strip()
-    except Exception as e:
-        logger.warning(f"  Summarisation failed for '{title[:50]}': {e}")
-        return (title[:220] + "…") if len(title) > 220 else title
+    """Trims the RSS excerpt to ~50 words. Free, no API needed."""
+    text = body if body else title
+    words = text.split()
+    if len(words) <= 52:
+        return text
+    return " ".join(words[:50]) + "…"
 
 
 # ── fetch from a single RSS source ──────────────────────────────────────────────
