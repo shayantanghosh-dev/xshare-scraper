@@ -6,6 +6,7 @@
 playwright>=1.40.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
+feedparser>=6.0.0
 
 # Data
 pandas>=2.0.0
@@ -18,3 +19,6 @@ APScheduler>=3.10.0
 
 # Env
 python-dotenv>=1.0.0
+
+# AI summarisation (tech news)
+anthropic>=0.40.0

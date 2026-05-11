@@ -1,15 +1,13 @@
 """
-xShare Master Scheduler  (v2)
+xShare Master Scheduler  (v3)
 ==============================
-Single entry point — runs all 6 scrapers every 6 hours.
+Single entry point — runs all scrapers on schedule.
 
-  Hackathons   : Unstop · Devfolio · Devpost · HackerEarth
-  Internships  : Unstop
-  Scholarships : Buddy4Study  (OPEN · CLOSED · ALWAYS_OPEN)
+  Every 6 hours : Hackathons · Internships · Scholarships
+  Daily (06:00 IST) : Tech News (25 stories, AI-summarised)
 
 ──────────────────────────────────────────────────────────────
-⚠  One-time Supabase schema change required for UPSERT to work.
-   Run these in the Supabase SQL editor before first launch:
+⚠  One-time Supabase schema changes required:
 
    ALTER TABLE hackathons
      ADD CONSTRAINT hackathons_url_unique UNIQUE (url);
@@ -17,7 +15,12 @@ Single entry point — runs all 6 scrapers every 6 hours.
    ALTER TABLE internships
      ADD CONSTRAINT internships_url_unique UNIQUE (url);
 
-   (scholarships already has UNIQUE on detail_url — no change needed)
+   -- tech_news table: run tech_news_schema.sql in Supabase SQL Editor
+
+Environment variables required:
+   SUPABASE_URL
+   SUPABASE_KEY
+   ANTHROPIC_API_KEY   ← needed for news summaries
 ──────────────────────────────────────────────────────────────
 """
 
@@ -28,8 +31,7 @@ import sys
 import traceback
 from datetime import datetime, timezone
 
-# ── Force all output to stdout so Railway streams it in real time ──────────────
-# Without this, Python buffers output and Railway shows nothing until the process ends.
+# ── Force all output to stdout so Railway streams in real time ─────────────────
 sys.stdout.reconfigure(line_buffering=True)
 logging.basicConfig(
     stream=sys.stdout,
@@ -44,6 +46,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 # ── Fetch functions ────────────────────────────────────────────────────────────
 from connectors.unstop             import fetch_hackathons  as unstop_fetch
@@ -52,8 +55,9 @@ from connectors.devpost            import fetch_hackathons  as devpost_fetch
 from connectors.hackerearth        import fetch_hackathons  as he_fetch
 from connectors.unstop_internships import fetch_internships as unstop_intern_fetch
 from connectors.buddy              import main              as buddy_main
+from connectors.tech_news          import fetch_tech_news
 
-# ── Save functions from connectors (handle field mapping for their own sources) ─
+# ── Save functions from connectors ────────────────────────────────────────────
 from connectors.unstop             import save_to_supabase  as unstop_hack_save
 from connectors.devpost            import save_to_supabase  as devpost_save
 from connectors.hackerearth        import save_to_supabase  as he_save
@@ -82,15 +86,10 @@ def _elapsed(t0: datetime) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CLEANUP HELPER  — deletes expired/delisted entries from any table
+#  CLEANUP HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _cleanup(table: str, source: str, current_urls: set) -> int:
-    """
-    Deletes rows from `table` where source=`source` and url is no longer
-    in `current_urls` (i.e. the listing was removed or expired at the source).
-    Returns count of deleted rows.
-    """
     try:
         res           = supabase.table(table).select("url").eq("source", source).execute()
         existing_urls = {r["url"] for r in (res.data or [])}
@@ -112,12 +111,9 @@ def _cleanup(table: str, source: str, current_urls: set) -> int:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DEVFOLIO SAVE — UPSERT + CLEANUP
-#  Devfolio's fetch already returns shaped records with a `url` field,
-#  so we can UPSERT directly (updates existing + inserts new).
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _upsert_and_clean_devfolio(records: list) -> tuple:
-    """Full UPSERT + cleanup for Devfolio. Returns (new, updated, deleted)."""
     records = [r for r in records if r.get("url")]
     if not records:
         print("    ⚠  No valid records to save.")
@@ -135,7 +131,6 @@ def _upsert_and_clean_devfolio(records: list) -> tuple:
     new_count     = len(current_urls - existing_urls)
     updated_count = len(current_urls & existing_urls)
 
-    # Delete expired
     to_delete = list(existing_urls - current_urls)
     deleted   = 0
     if to_delete:
@@ -149,7 +144,6 @@ def _upsert_and_clean_devfolio(records: list) -> tuple:
         except Exception as e:
             print(f"    ⚠  Cleanup failed (non-fatal): {e}")
 
-    # UPSERT
     for i in range(0, len(records), BATCH_SIZE):
         chunk = records[i : i + BATCH_SIZE]
         try:
@@ -166,7 +160,6 @@ def _upsert_and_clean_devfolio(records: list) -> tuple:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _upsert_scholarships(df: pd.DataFrame) -> tuple:
-    """Full UPSERT + cleanup for scholarships. Returns (new, updated, deleted)."""
     if df is None or df.empty:
         print("    ⚠  No scholarship data to save.")
         return 0, 0, 0
@@ -205,7 +198,6 @@ def _upsert_scholarships(df: pd.DataFrame) -> tuple:
     new_count     = len(current_urls - existing_urls)
     updated_count = len(current_urls & existing_urls)
 
-    # Delete expired
     to_delete = list(existing_urls - current_urls)
     deleted   = 0
     if to_delete:
@@ -218,7 +210,6 @@ def _upsert_scholarships(df: pd.DataFrame) -> tuple:
         except Exception as e:
             print(f"    ⚠  Scholarship cleanup failed (non-fatal): {e}")
 
-    # UPSERT
     for i in range(0, len(cleaned), BATCH_SIZE):
         chunk = cleaned[i : i + BATCH_SIZE]
         try:
@@ -231,12 +222,61 @@ def _upsert_scholarships(df: pd.DataFrame) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  NEWS SAVE — UPSERT (keep last 7 days, delete older)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _save_tech_news(records: list) -> tuple:
+    """
+    Upserts today's 25 news items.
+    Deletes records older than 7 days to keep the table lean.
+    Returns (new, updated, deleted).
+    """
+    if not records:
+        print("    ⚠  No news records to save.")
+        return 0, 0, 0
+
+    current_urls = {r["url"] for r in records}
+
+    # Snapshot existing
+    try:
+        res           = supabase.table("tech_news").select("url").execute()
+        existing_urls = {r["url"] for r in (res.data or [])}
+    except Exception as e:
+        print(f"    ⚠  Could not read existing news: {e}")
+        existing_urls = set()
+
+    new_count     = len(current_urls - existing_urls)
+    updated_count = len(current_urls & existing_urls)
+
+    # Delete news older than 7 days
+    deleted = 0
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        res = supabase.table("tech_news").delete().lt("scraped_at", cutoff).execute()
+        deleted = len(res.data or [])
+        if deleted:
+            print(f"    🗑  Removed {deleted} news items older than 7 days")
+    except Exception as e:
+        print(f"    ⚠  Old news cleanup failed (non-fatal): {e}")
+
+    # Upsert today's batch
+    for i in range(0, len(records), BATCH_SIZE):
+        chunk = records[i : i + BATCH_SIZE]
+        try:
+            supabase.table("tech_news").upsert(chunk, on_conflict="url").execute()
+        except Exception as e:
+            print(f"    ✗  News upsert batch {i // BATCH_SIZE + 1} failed: {e}")
+
+    print(f"    ✓  {new_count} new  ·  {updated_count} updated  ·  {deleted} old removed")
+    return new_count, updated_count, deleted
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  INDIVIDUAL SCRAPER RUNNERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_unstop_hackathons() -> tuple:
-    # Unstop raw items use `seo_url` — connector's save handles the mapping.
-    # We add cleanup separately using the same seo_url values.
     async def job():
         data = await unstop_fetch(max_pages=20)
         if not data:
@@ -250,7 +290,6 @@ def _run_unstop_hackathons() -> tuple:
 
 
 def _run_devfolio() -> tuple:
-    # Devfolio fetch already returns shaped records with `url` — full UPSERT.
     async def job():
         data = await devfolio_fetch(max_scrolls=20)
         return _upsert_and_clean_devfolio(data)
@@ -258,7 +297,6 @@ def _run_devfolio() -> tuple:
 
 
 def _run_devpost() -> tuple:
-    # Devpost raw items have extra API fields — connector's save builds clean records.
     data = devpost_fetch(max_pages=60)
     if not data:
         return 0, 0, 0
@@ -270,11 +308,10 @@ def _run_devpost() -> tuple:
 
 
 def _run_hackerearth() -> tuple:
-    # HackerEarth URLs may be relative — connector's save normalises them.
     data = he_fetch()
     if not data:
         return 0, 0, 0
-    saved = he_save(data)
+    saved   = he_save(data)
     current = set()
     for h in data:
         url = h.get("url", "")
@@ -288,7 +325,6 @@ def _run_hackerearth() -> tuple:
 
 
 def _run_unstop_internships() -> tuple:
-    # Same as Unstop hackathons — raw items use `seo_url`.
     async def job():
         data = await unstop_intern_fetch(max_pages=50)
         if not data:
@@ -316,11 +352,18 @@ def _run_buddy4study() -> tuple:
     return _upsert_scholarships(df)
 
 
+def _run_tech_news() -> tuple:
+    records = fetch_tech_news()
+    print(f"    Fetched {len(records)} news items from HackerNews")
+    return _save_tech_news(records)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCRAPER REGISTRY
+#  SCRAPER REGISTRIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-SCRAPERS = [
+# Runs every 6 hours
+SCRAPERS_6H = [
     ("Unstop",       "Hackathons",   _run_unstop_hackathons),
     ("Devfolio",     "Hackathons",   _run_devfolio),
     ("Devpost",      "Hackathons",   _run_devpost),
@@ -329,10 +372,14 @@ SCRAPERS = [
     ("Buddy4Study",  "Scholarships", _run_buddy4study),
 ]
 
+# Runs once daily at 06:00 IST
+SCRAPERS_DAILY = [
+    ("HackerNews",   "Tech News",    _run_tech_news),
+]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ISOLATED RUNNER WRAPPER
-#  One scraper crashing will NEVER stop the others or kill the scheduler.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_isolated(index: int, total: int, name: str, category: str, fn) -> tuple | None:
@@ -353,10 +400,11 @@ def _run_isolated(index: int, total: int, name: str, category: str, fn) -> tuple
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MASTER JOB
+#  MASTER JOBS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_all_scrapers():
+    """Runs hackathons + internships + scholarships every 6 hours."""
     global _run_count
     _run_count += 1
 
@@ -367,8 +415,8 @@ def run_all_scrapers():
     category_totals: dict = {}
     failed_scrapers: list = []
 
-    for i, (name, category, fn) in enumerate(SCRAPERS, 1):
-        result = _run_isolated(i, len(SCRAPERS), name, category, fn)
+    for i, (name, category, fn) in enumerate(SCRAPERS_6H, 1):
+        result = _run_isolated(i, len(SCRAPERS_6H), name, category, fn)
 
         if category not in category_totals:
             category_totals[category] = {"new": 0, "updated": 0, "removed": 0}
@@ -396,7 +444,26 @@ def run_all_scrapers():
         print(f"\n  ⚠  Failed scrapers (all others ran fine):")
         for s in failed_scrapers:
             print(f"     • {s}")
-    print(f"\n  Next run in 6 hours.")
+    print(f"\n  Next scraper run in 6 hours.")
+    print(f"{'═' * W}\n")
+
+
+def run_news():
+    """Runs the tech news job — called daily at 06:00 IST."""
+    start = datetime.now()
+    ts    = start.strftime("%Y-%m-%d  %H:%M:%S")
+    print(f"\n{_banner(f'DAILY NEWS  ·  {ts}')}")
+
+    result = _run_isolated(1, 1, "HackerNews", "Tech News", _run_tech_news)
+
+    elapsed = round((datetime.now() - start).total_seconds())
+    print(f"\n{_banner(f'NEWS DONE  ·  {elapsed}s total')}")
+    if result:
+        new, updated, removed = result
+        print(f"  Tech News  {new:>3} new  ·  {updated:>3} updated  ·  {removed:>3} old removed")
+    else:
+        print("  ⚠  News run failed.")
+    print(f"\n  Next news run tomorrow at 06:00 IST.")
     print(f"{'═' * W}\n")
 
 
@@ -405,28 +472,40 @@ def run_all_scrapers():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(_banner("XSHARE MASTER SCHEDULER"))
+    print(_banner("XSHARE MASTER SCHEDULER  v3"))
     print()
-    print("  Sources")
-    print("    Hackathons   : Unstop · Devfolio · Devpost · HackerEarth")
-    print("    Internships  : Unstop")
-    print("    Scholarships : Buddy4Study  (Live · Upcoming · Always Open)")
+    print("  Jobs")
+    print("    Every 6 h    : Unstop · Devfolio · Devpost · HackerEarth")
+    print("                   Unstop Internships · Buddy4Study Scholarships")
+    print("    Daily 06:00  : HackerNews Top 25 Tech News (AI-summarised)")
     print()
-    print("  Schedule : every 6 hours · Asia/Kolkata")
+    print("  Timezone : Asia/Kolkata")
     print()
-    print("  ⚠  One-time schema change — run in Supabase SQL editor if not done:")
-    print("     ALTER TABLE hackathons  ADD CONSTRAINT hackathons_url_unique  UNIQUE (url);")
-    print("     ALTER TABLE internships ADD CONSTRAINT internships_url_unique UNIQUE (url);")
+    print("  Required env vars: SUPABASE_URL  SUPABASE_KEY  ANTHROPIC_API_KEY")
     print()
 
+    # Run everything immediately on startup
     run_all_scrapers()
+    run_news()
 
     scheduler = BlockingScheduler(timezone="Asia/Kolkata")
+
+    # Hackathons + Internships + Scholarships — every 6 hours
     scheduler.add_job(
         run_all_scrapers,
         IntervalTrigger(hours=6),
-        id            = "xshare_master_6h",
-        name          = "xShare Master Scraper — Every 6 Hours",
+        id            = "xshare_6h",
+        name          = "xShare Scrapers — Every 6 Hours",
+        max_instances = 1,
+        coalesce      = True,
+    )
+
+    # Tech News — daily at 06:00 IST
+    scheduler.add_job(
+        run_news,
+        CronTrigger(hour=6, minute=0, timezone="Asia/Kolkata"),
+        id            = "xshare_news_daily",
+        name          = "xShare Tech News — Daily 06:00 IST",
         max_instances = 1,
         coalesce      = True,
     )
