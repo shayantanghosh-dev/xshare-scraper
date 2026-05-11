@@ -1,5 +1,0 @@
-playwright==1.49.0
-supabase==2.9.1
-python-dotenv==1.2.2
-apscheduler==3.10.4
-requests==2.33.1
