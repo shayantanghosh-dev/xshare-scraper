@@ -3,14 +3,29 @@ Indeed Jobs — Apify connector
 Triggers the saved Apify task, polls until done, pulls dataset,
 normalises, and upserts into the `jobs` Supabase table.
 
-The Apify Indeed actor returns several nested / dict fields:
-  - company     → "employerName" string  (not "company")
-  - location    → dict {city, state, countryName, ...}  OR plain string
-  - description → dict {text: "...", html: "..."} OR plain string
-  - salary      → dict {min, max, currency, period}  OR plain string
-  - date_posted → "datePosted" (not "datePostedFormatted")
+New fields extracted (v2):
+  work_mode          — "Remote" / "Hybrid" / "On-site"  (from attributes/jobType/location)
+  company_logo       — employer logo URL
+  company_rating     — employer rating (float, e.g. 3.9)
+  company_industry   — employer industry string
+  company_size       — employee count string (e.g. "10,000+")
+  company_website    — corporate website URL
+  benefits           — list of benefit strings (health, 401k, PTO …)
+  degree_required    — parsed from attributes (e.g. "Bachelor's degree")
+  experience_years   — parsed from attributes (e.g. "6 years")
+  description        — full plain-text job description
+  tagline            — first ~300 chars of description (for card previews)
 
-All of these are handled defensively in the extractor functions.
+The Apify Indeed actor returns several nested / dict fields:
+  - company     → employer dict  {name, logoUrl, ratingsValue, industry, …}
+  - location    → dict {city, state, countryName, …}  OR plain string
+  - description → dict {text, html}  OR plain string
+  - baseSalary  → dict {min, max, unitOfWork, currencyCode}
+  - attributes  → flat dict  {CODE: "label", …}  — skills, benefits, job type, degree, exp
+  - benefits    → flat dict  {CODE: "label", …}
+  - jobTypes    → flat dict  {CODE: "label", …}
+
+All are handled defensively.
 
 Env vars required:
   APIFY_TOKEN
@@ -42,6 +57,25 @@ APIFY_BASE = "https://api.apify.com/v2"
 POLL_INTERVAL = 15
 MAX_WAIT_S    = 600
 
+# ── Known attribute label patterns ────────────────────────────────────────────
+# Indeed's `attributes` dict maps opaque codes to human-readable labels.
+# We scan the values to pull out degree, experience, and work-mode hints.
+
+_DEGREE_KEYWORDS = (
+    "bachelor", "master", "phd", "doctorate", "associate",
+    "high school", "diploma", "b.tech", "b.e.", "mba",
+)
+_EXPERIENCE_RE = re.compile(
+    r"(\d+)\s*(?:\+\s*)?year", re.IGNORECASE
+)
+_REMOTE_KEYWORDS  = ("remote", "work from home", "virtual")
+_HYBRID_KEYWORDS  = ("hybrid",)
+_BENEFIT_KEYWORDS = (
+    "insurance", "401(k)", "pension", "paid time", "paid holiday",
+    "pto", "bonus", "stock", "maternity", "paternity", "leave",
+    "reimbursement", "allowance", "provident fund", "esop", "gratuity",
+)
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -64,48 +98,65 @@ def _clean(v) -> str:
 def _clean_text(v) -> str:
     """
     Strip HTML tags and collapse all whitespace (including \\n \\t) to
-    single spaces. Used for description → tagline extraction.
+    single spaces. Used for description and tagline fields.
     """
     if not v:
         return ""
     s = str(v)
-    s = re.sub(r"<[^>]+>", " ", s)      # strip HTML
+    s = re.sub(r"<[^>]+>", " ", s)      # strip HTML tags
     s = re.sub(r"\s+", " ", s).strip()  # collapse whitespace / newlines
     return s
-
-def _is_remote(location: str, job_type: str) -> bool:
-    combined = f"{location} {job_type}".lower()
-    return any(k in combined for k in ("remote", "hybrid", "work from home", "virtual"))
 
 
 # ── field extractors ─────────────────────────────────────────────────────────
 
-def _extract_company(item: dict) -> str:
+def _extract_company_fields(item: dict) -> dict:
     """
-    The Apify Indeed actor stores the company under 'employerName'.
-    Fall back through several alternatives in case the schema varies.
+    Pulls all employer-related fields from the `employer` dict or top-level keys.
+    Returns a flat dict with:
+      company, company_logo, company_rating, company_industry,
+      company_size, company_website
     """
-    for key in ("employerName", "employer", "company",
-                "companyName", "company_name", "hiringOrganization"):
-        val = item.get(key)
-        if not val:
-            continue
-        if isinstance(val, dict):
-            name = val.get("name") or val.get("companyName") or ""
-            if name:
-                return _clean(name)
-        else:
-            cleaned = _clean(val)
-            if cleaned:
-                return cleaned
-    return ""
+    employer = item.get("employer") or {}
+
+    # Company name
+    name = ""
+    for key in ("employerName", "company", "companyName"):
+        val = _clean(item.get(key, ""))
+        if val:
+            name = val
+            break
+    if not name:
+        name = _clean(employer.get("name", ""))
+
+    logo    = _clean(employer.get("logoUrl", ""))
+    rating  = employer.get("ratingsValue")          # float e.g. 3.9
+    industry = _clean(employer.get("industry", ""))
+    size    = _clean(employer.get("employeesCount", ""))
+    website = _clean(employer.get("corporateWebsite", ""))
+
+    # Normalise rating to float or None
+    if rating is not None:
+        try:
+            rating = round(float(rating), 1)
+        except (ValueError, TypeError):
+            rating = None
+
+    return {
+        "company":          name,
+        "company_logo":     logo,
+        "company_rating":   rating,
+        "company_industry": industry,
+        "company_size":     size,
+        "company_website":  website,
+    }
 
 
 def _extract_location(item: dict) -> str:
     """
     Location can be:
       - a plain string  → use directly
-      - a dict {city, state, countryName, countryCode, ...}
+      - a dict {city, state, countryName, countryCode, …}
     """
     for key in ("location", "jobLocation", "locationName", "jobCity"):
         val = item.get(key)
@@ -117,7 +168,7 @@ def _extract_location(item: dict) -> str:
                 return cleaned
         if isinstance(val, dict):
             city    = _clean(val.get("city", ""))
-            state   = _clean(val.get("state", ""))
+            state   = _clean(val.get("state", "") or val.get("admin1Code", ""))
             country = _clean(val.get("countryName", "") or val.get("countryCode", ""))
             parts   = [p for p in (city, state) if p]
             if parts:
@@ -129,8 +180,8 @@ def _extract_location(item: dict) -> str:
 
 def _extract_description(item: dict) -> str:
     """
-    Description can be a plain string or a dict {text: '...', html: '...'}.
-    Returns cleaned plain text (no HTML, no raw newlines).
+    Description can be a plain string or a dict {text, html}.
+    Returns the full cleaned plain text.
     """
     for key in ("description", "descriptionText", "jobDescription",
                 "summary", "jobContent", "fullDescription"):
@@ -150,12 +201,27 @@ def _extract_description(item: dict) -> str:
 
 def _extract_salary(item: dict) -> str:
     """
-    Salary can be:
-      - a plain string
-      - a dict {from/min, to/max, currency, period}
+    Prefers `baseSalary` dict {min, max, unitOfWork, currencyCode}.
+    Falls back to plain-string salary fields.
     """
-    for key in ("salary", "salaryRange", "compensation",
-                "salaryInfo", "salaryText", "pay"):
+    # ── Structured baseSalary (Indeed's preferred field) ──
+    bs = item.get("baseSalary")
+    if isinstance(bs, dict) and (bs.get("min") or bs.get("max")):
+        lo     = bs.get("min")
+        hi     = bs.get("max")
+        cur    = _clean(bs.get("currencyCode", "₹")) or "₹"
+        period = _clean(bs.get("unitOfWork", "") or bs.get("period", "")).upper()
+        suffix = {"YEAR": "/yr", "MONTH": "/mo", "HOUR": "/hr"}.get(period, "")
+        if lo and hi:
+            return f"{cur} {int(lo):,} – {cur} {int(hi):,}{suffix}"
+        if hi:
+            return f"Up to {cur} {int(hi):,}{suffix}"
+        if lo:
+            return f"From {cur} {int(lo):,}{suffix}"
+
+    # ── Generic string / dict fallback ──
+    for key in ("salary", "salaryRange", "compensation", "salaryInfo",
+                "salaryText", "pay"):
         val = item.get(key)
         if not val:
             continue
@@ -178,28 +244,185 @@ def _extract_salary(item: dict) -> str:
                 return f"Up to {cur}{int(hi):,}{suffix}"
             if lo:
                 return f"From {cur}{int(lo):,}{suffix}"
+
     return "Not disclosed"
 
 
-def _extract_experience(item: dict) -> str:
-    """Experience level — Indeed actors use varying field names."""
-    for key in ("experienceLevel", "experience", "jobLevel",
-                "seniorityLevel", "seniority", "careerLevel",
-                "minimumExperience", "requiredExperience"):
-        val = item.get(key)
-        if not val:
-            continue
-        if isinstance(val, str):
-            cleaned = val.strip()
+def _extract_job_type(item: dict) -> str:
+    """
+    Job type / contract type.
+    Also checks the `jobTypes` dict and `attributes` dict from Indeed.
+    """
+    # Direct fields
+    for key in ("jobType", "contractType", "employmentType"):
+        val = _clean(item.get(key, ""))
+        if val and val.lower() not in ("null", "none"):
+            return val
+
+    # jobTypes dict  {CODE: "Full-time", …}
+    jt = item.get("jobTypes")
+    if isinstance(jt, dict) and jt:
+        return next(iter(jt.values()))
+
+    # attributes dict  — look for job-type-ish values
+    attrs = item.get("attributes") or item.get("employerAttributes") or {}
+    if isinstance(attrs, dict):
+        for label in attrs.values():
+            lc = _clean(label).lower()
+            if any(k in lc for k in ("full-time", "part-time", "contract",
+                                      "temporary", "internship", "permanent")):
+                return _clean(label)
+
+    return "Full-time"
+
+
+def _extract_work_mode(item: dict, location: str) -> str:
+    """
+    Classify the job as Remote / Hybrid / On-site.
+    Checks attributes, jobTypes, and the location string.
+    """
+    # Check attributes dict for remote/hybrid signals
+    attrs = item.get("attributes") or item.get("employerAttributes") or {}
+    if isinstance(attrs, dict):
+        for label in attrs.values():
+            lc = _clean(label).lower()
+            if any(k in lc for k in _REMOTE_KEYWORDS):
+                return "Remote"
+            if any(k in lc for k in _HYBRID_KEYWORDS):
+                return "Hybrid"
+
+    # Check jobType field
+    for key in ("jobType", "contractType", "workType", "remoteAllowed"):
+        val = _clean(item.get(key, "")).lower()
+        if "remote" in val:
+            return "Remote"
+        if "hybrid" in val:
+            return "Hybrid"
+
+    # Fall back to location string
+    loc = location.lower()
+    if "remote" in loc:
+        return "Remote"
+    if "hybrid" in loc:
+        return "Hybrid"
+
+    return "On-site"
+
+
+def _extract_benefits(item: dict) -> list[str]:
+    """
+    Indeed provides a `benefits` dict {CODE: "label"}.
+    Also scans `attributes` for benefit-like values.
+    Returns a list of human-readable benefit strings.
+    """
+    seen:   set[str]  = set()
+    result: list[str] = []
+
+    def _add(label: str) -> None:
+        clean = _clean(label)
+        if clean and clean.lower() not in seen:
+            seen.add(clean.lower())
+            result.append(clean)
+
+    # Dedicated benefits dict
+    benefits = item.get("benefits")
+    if isinstance(benefits, dict):
+        for label in benefits.values():
+            _add(label)
+
+    # socialInsurance dict (subset of benefits on some actors)
+    social = item.get("socialInsurance")
+    if isinstance(social, dict):
+        for label in social.values():
+            _add(label)
+
+    # Scan attributes for anything that looks like a benefit
+    attrs = item.get("attributes") or {}
+    if isinstance(attrs, dict):
+        for label in attrs.values():
+            lc = _clean(label).lower()
+            if any(k in lc for k in _BENEFIT_KEYWORDS):
+                _add(label)
+
+    return result
+
+
+def _extract_degree_and_experience(item: dict) -> tuple[str, str]:
+    """
+    Parses the `attributes` dict for:
+      - degree_required  e.g. "Bachelor's degree", "Master's degree"
+      - experience_years e.g. "6 years"
+    Returns (degree, experience_years) — either may be ''.
+    """
+    degree = ""
+    exp    = ""
+
+    attrs = item.get("attributes") or {}
+    if not isinstance(attrs, dict):
+        return degree, exp
+
+    for label in attrs.values():
+        lc = _clean(label).lower()
+
+        # Degree
+        if not degree and any(k in lc for k in _DEGREE_KEYWORDS):
+            degree = _clean(label)
+
+        # Years of experience
+        if not exp:
+            m = _EXPERIENCE_RE.search(lc)
+            if m:
+                exp = _clean(label)   # e.g. "6 years"
+
+    # Also check dedicated experience fields
+    if not exp:
+        for key in ("experienceLevel", "experience", "minimumExperience",
+                    "requiredExperience", "jobLevel", "seniorityLevel"):
+            val = item.get(key)
+            if not val:
+                continue
+            if isinstance(val, (int, float)) and val > 0:
+                exp = f"{int(val)}+ years"
+                break
+            cleaned = _clean(str(val))
             if cleaned and cleaned.lower() not in ("null", "none", ""):
-                return cleaned
-        if isinstance(val, (int, float)) and val > 0:
-            return f"{int(val)}+ years"
+                exp = cleaned
+                break
+
+    return degree, exp
+
+
+def _extract_posted_at(item: dict) -> str:
+    """Date the job was posted. Prefer ISO strings over relative strings."""
+    for key in ("datePublished", "datePosted", "postedAt", "publishedAt",
+                "date", "postedDate", "dateOnIndeed", "postDate",
+                "created_at", "formattedDate", "datePostedFormatted"):
+        val = _clean(item.get(key, ""))
+        if val and val.lower() not in ("null", "none", ""):
+            return val
+    return ""
+
+
+def _extract_applicants(item: dict) -> str:
+    """Number of applicants (not always present on Indeed)."""
+    for key in ("numberOfApplicants", "applicantCount", "applies",
+                "totalApplicants", "applicants"):
+        val = item.get(key)
+        if val is None:
+            continue
+        try:
+            n = int(val)
+            if n > 0:
+                return f"{n:,}"
+        except (ValueError, TypeError):
+            s = _clean(str(val))
+            if s and s.lower() not in ("null", "none", "0"):
+                return s
     return ""
 
 
 def _extract_skills(item: dict) -> list[str]:
-    """Skills list — may be absent for Indeed; handle gracefully."""
+    """Skills list — may be absent for Indeed; handled gracefully."""
     for key in ("skills", "requiredSkills", "preferredSkills",
                 "jobSkills", "skillList", "qualifications"):
         raw = item.get(key)
@@ -220,36 +443,24 @@ def _extract_skills(item: dict) -> list[str]:
                 return result
         if isinstance(raw, str) and raw.strip():
             return [s.strip() for s in raw.split(",") if s.strip()]
+
+    # Fall back: scan attributes for skill-ish values
+    # (filter out degree, experience, benefit, job-type labels already captured)
+    attrs = item.get("attributes") or {}
+    if isinstance(attrs, dict):
+        _non_skill = _DEGREE_KEYWORDS + _BENEFIT_KEYWORDS + (
+            "full-time", "part-time", "contract", "temporary",
+            "remote", "hybrid", "on-site", "year",
+        )
+        skills = []
+        for label in attrs.values():
+            lc = _clean(label).lower()
+            if not any(k in lc for k in _non_skill):
+                skills.append(_clean(label))
+        if skills:
+            return skills
+
     return []
-
-
-def _extract_posted_at(item: dict) -> str:
-    """Date the job was posted; try every field name Indeed actors use."""
-    for key in ("datePosted", "postedAt", "publishedAt", "date",
-                "postedDate", "datePostedFormatted", "postDate",
-                "created_at", "formattedDate"):
-        val = _clean(item.get(key, ""))
-        if val and val.lower() not in ("null", "none", ""):
-            return val
-    return ""
-
-
-def _extract_applicants(item: dict) -> str:
-    """Number of applicants (not always available on Indeed)."""
-    for key in ("numberOfApplicants", "applicantCount", "applies",
-                "totalApplicants", "applicants"):
-        val = item.get(key)
-        if val is None:
-            continue
-        try:
-            n = int(val)
-            if n > 0:
-                return f"{n:,}"
-        except (ValueError, TypeError):
-            s = _clean(str(val))
-            if s and s.lower() not in ("null", "none", "0"):
-                return s
-    return ""
 
 
 # ── Apify API calls ───────────────────────────────────────────────────────────
@@ -335,10 +546,15 @@ def _normalise(item: dict) -> dict | None:
     if not title:
         return None
 
-    company     = _extract_company(item)
-    location    = _extract_location(item)
-    description = _extract_description(item)
-    salary      = _extract_salary(item)
+    # ── aggregated extractions ─────────────────────────────────────────────
+    company_fields               = _extract_company_fields(item)
+    location                     = _extract_location(item)
+    description                  = _extract_description(item)
+    salary                       = _extract_salary(item)
+    job_type                     = _extract_job_type(item)
+    work_mode                    = _extract_work_mode(item, location)
+    benefits                     = _extract_benefits(item)
+    degree_required, exp_years   = _extract_degree_and_experience(item)
 
     tagline = (
         description[:300].rsplit(" ", 1)[0] + "…"
@@ -346,23 +562,45 @@ def _normalise(item: dict) -> dict | None:
         else description
     )
 
-    job_type = _clean(item.get("jobType") or item.get("contractType", ""))
-
     return {
-        "source":           SOURCE,
-        "title":            title,
-        "company":          company,
-        "location":         location,
-        "url":              url,
-        "tagline":          tagline,
-        "job_type":         job_type or "Full-time",
-        "experience_level": _extract_experience(item),
-        "is_remote":        _is_remote(location, job_type),
-        "salary":           salary,
-        "skills":           _extract_skills(item),
-        "applicants":       _extract_applicants(item),
-        "date_posted":      _extract_posted_at(item),
-        "scraped_at":       datetime.now(timezone.utc).isoformat(),
+        # ── core identity ──────────────────────────────────────────────────
+        "source":             SOURCE,
+        "url":                url,
+
+        # ── job basics ─────────────────────────────────────────────────────
+        "title":              title,
+        "tagline":            tagline,
+        "description":        description,
+        "job_type":           job_type,
+        "work_mode":          work_mode,
+
+        # ── company ────────────────────────────────────────────────────────
+        "company":            company_fields["company"],
+        "company_logo":       company_fields["company_logo"],
+        "company_rating":     company_fields["company_rating"],
+        "company_industry":   company_fields["company_industry"],
+        "company_size":       company_fields["company_size"],
+        "company_website":    company_fields["company_website"],
+
+        # ── location & remote ──────────────────────────────────────────────
+        "location":           location,
+        "is_remote":          work_mode in ("Remote", "Hybrid"),
+
+        # ── compensation ───────────────────────────────────────────────────
+        "salary":             salary,
+        "benefits":           benefits,            # list[str]
+
+        # ── requirements ───────────────────────────────────────────────────
+        "degree_required":    degree_required,
+        "experience_level":   exp_years,
+
+        # ── apply info ─────────────────────────────────────────────────────
+        "applicants":         _extract_applicants(item),
+
+        # ── skills & dates ─────────────────────────────────────────────────
+        "skills":             _extract_skills(item),
+        "date_posted":        _extract_posted_at(item),
+        "scraped_at":         datetime.now(timezone.utc).isoformat(),
     }
 
 
