@@ -1,29 +1,18 @@
 """
-xShare Master Scheduler  (v4)
+xShare Master Scheduler  (v5)
 ==============================
-Single entry point — runs all scrapers on schedule.
+Single entry point — runs all scrapers on a fixed schedule.
 
-  Every 6 hours : Hackathons · Internships · Scholarships · Jobs
-  Daily (06:00 IST) : Tech News (25 stories, AI-summarised)
-
-──────────────────────────────────────────────────────────────
-⚠  One-time Supabase schema changes required:
-
-   ALTER TABLE hackathons
-     ADD CONSTRAINT hackathons_url_unique UNIQUE (url);
-
-   ALTER TABLE internships
-     ADD CONSTRAINT internships_url_unique UNIQUE (url);
-
-   -- tech_news table: run tech_news_schema.sql in Supabase SQL Editor
-   -- jobs table:      run jobs_schema.sql in Supabase SQL Editor
+  Every 6 hours:
+    Hackathons   → Unstop, Devfolio, Devpost, HackerEarth
+    Internships  → Unstop
+    Scholarships → Buddy4Study
+    Jobs         → LinkedIn, Indeed  (via Apify — requires APIFY_TOKEN)
 
 Environment variables required:
-   SUPABASE_URL
-   SUPABASE_KEY
-   ANTHROPIC_API_KEY   ← needed for news summaries
-   APIFY_TOKEN         ← needed for LinkedIn & Indeed jobs
-──────────────────────────────────────────────────────────────
+  SUPABASE_URL
+  SUPABASE_KEY
+  APIFY_TOKEN   ← LinkedIn & Indeed jobs (skipped gracefully if absent)
 """
 
 import asyncio
@@ -33,13 +22,24 @@ import sys
 import traceback
 from datetime import datetime, timezone
 
-# ── Force all output to stdout so Railway streams in real time ─────────────────
+# ── Flush stdout immediately so Railway streams logs in real time ──────────────
 sys.stdout.reconfigure(line_buffering=True)
+
+# ── Silence noisy third-party loggers ─────────────────────────────────────────
+#    httpx / httpcore print every Supabase HTTP call at INFO level.
+#    APScheduler prints scheduler internals. We only want WARNING+ from them.
+for _noisy in (
+    "httpx", "httpcore",
+    "apscheduler.scheduler", "apscheduler.executors.default",
+    "supabase", "postgrest",
+    "anthropic",
+):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 logging.basicConfig(
     stream=sys.stdout,
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
+    level=logging.WARNING,
+    format="%(levelname)s  %(name)s  %(message)s",
     force=True,
 )
 
@@ -48,20 +48,17 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pandas as pd
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.triggers.cron import CronTrigger
 
-# ── Fetch functions ────────────────────────────────────────────────────────────
+# ── Connector imports ──────────────────────────────────────────────────────────
 from connectors.unstop             import fetch_hackathons  as unstop_fetch
 from connectors.devfolio           import fetch_hackathons  as devfolio_fetch
 from connectors.devpost            import fetch_hackathons  as devpost_fetch
 from connectors.hackerearth        import fetch_hackathons  as he_fetch
 from connectors.unstop_internships import fetch_internships as unstop_intern_fetch
 from connectors.buddy              import main              as buddy_main
-from connectors.tech_news          import fetch_tech_news
 from connectors.linkedin_jobs      import fetch_jobs        as linkedin_fetch
 from connectors.indeed_jobs        import fetch_jobs        as indeed_fetch
 
-# ── Save functions from connectors ────────────────────────────────────────────
 from connectors.unstop             import save_to_supabase  as unstop_hack_save
 from connectors.devpost            import save_to_supabase  as devpost_save
 from connectors.hackerearth        import save_to_supabase  as he_save
@@ -72,30 +69,69 @@ from connectors.indeed_jobs        import save_to_supabase  as indeed_save
 from utils.supabase_client import supabase
 
 BATCH_SIZE = 500
-W          = 56
+W          = 60
 _run_count = 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DISPLAY HELPERS
+#  OUTPUT HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _banner(text: str, char: str = "═") -> str:
-    return f"{char * W}\n  {text}\n{char * W}"
+def _line(char: str = "═") -> str:
+    return char * W
 
-def _section(n: int, total: int, source: str, category: str) -> str:
-    label = f"[{n}/{total}]  {source}  ·  {category}"
-    return f"\n{'─' * W}\n  {label}\n{'─' * W}"
+def _banner(text: str) -> None:
+    print(f"\n{_line()}")
+    print(f"  {text}")
+    print(_line())
 
-def _elapsed(t0: datetime) -> float:
-    return round((datetime.now() - t0).total_seconds(), 1)
+def _section(n: int, total: int, source: str, category: str) -> None:
+    print(f"\n{_line('-')}")
+    print(f"  [{n}/{total}]  {source}  —  {category}")
+    print(_line('-'))
+
+def _ok(msg: str) -> None:
+    print(f"  ✓  {msg}")
+
+def _warn(msg: str) -> None:
+    print(f"  ⚠  {msg}")
+
+def _fail(msg: str) -> None:
+    print(f"  ✗  {msg}")
+
+def _elapsed(t0: datetime) -> str:
+    secs = round((datetime.now() - t0).total_seconds(), 1)
+    return f"{secs}s"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CLEANUP HELPER
+#  STARTUP CHECKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _check_env() -> dict[str, bool]:
+    """Warn clearly about any missing env vars."""
+    checks = {
+        "SUPABASE_URL": bool(os.environ.get("SUPABASE_URL")),
+        "SUPABASE_KEY": bool(os.environ.get("SUPABASE_KEY")),
+        "APIFY_TOKEN":  bool(os.environ.get("APIFY_TOKEN")),
+    }
+    missing = [k for k, ok in checks.items() if not ok]
+    if missing:
+        print()
+        for k in missing:
+            _warn(f"Env var not set: {k}")
+        if "APIFY_TOKEN" in missing:
+            _warn("LinkedIn & Indeed job scrapers will be SKIPPED until APIFY_TOKEN is set")
+        print()
+    return checks
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SUPABASE CLEANUP HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _cleanup(table: str, source: str, current_urls: set) -> int:
+    """Delete rows from `table` for `source` whose URLs are no longer live."""
     try:
         res           = supabase.table(table).select("url").eq("source", source).execute()
         existing_urls = {r["url"] for r in (res.data or [])}
@@ -108,21 +144,21 @@ def _cleanup(table: str, source: str, current_urls: set) -> int:
             supabase.table(table).delete() \
                 .eq("source", source).in_("url", chunk).execute()
             deleted += len(chunk)
-        print(f"    🗑  Removed {deleted} expired / delisted entries")
+        print(f"  🗑  Removed {deleted} expired entries")
         return deleted
     except Exception as e:
-        print(f"    ⚠  Cleanup failed (non-fatal): {e}")
+        _warn(f"Cleanup failed (non-fatal): {e}")
         return 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DEVFOLIO SAVE — UPSERT + CLEANUP
+#  DEVFOLIO SAVE  (upsert + cleanup)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _upsert_and_clean_devfolio(records: list) -> tuple:
+def _save_devfolio(records: list) -> tuple[int, int, int]:
     records = [r for r in records if r.get("url")]
     if not records:
-        print("    ⚠  No valid records to save.")
+        _warn("No valid records to save.")
         return 0, 0, 0
 
     current_urls = {r["url"] for r in records}
@@ -131,7 +167,7 @@ def _upsert_and_clean_devfolio(records: list) -> tuple:
         res           = supabase.table("hackathons").select("url").eq("source", "devfolio").execute()
         existing_urls = {r["url"] for r in (res.data or [])}
     except Exception as e:
-        print(f"    ⚠  Could not read existing rows: {e}")
+        _warn(f"Could not read existing rows: {e}")
         existing_urls = set()
 
     new_count     = len(current_urls - existing_urls)
@@ -146,28 +182,28 @@ def _upsert_and_clean_devfolio(records: list) -> tuple:
                 supabase.table("hackathons").delete() \
                     .eq("source", "devfolio").in_("url", chunk).execute()
                 deleted += len(chunk)
-            print(f"    🗑  Removed {deleted} expired / delisted entries")
+            print(f"  🗑  Removed {deleted} expired entries")
         except Exception as e:
-            print(f"    ⚠  Cleanup failed (non-fatal): {e}")
+            _warn(f"Cleanup failed (non-fatal): {e}")
 
     for i in range(0, len(records), BATCH_SIZE):
         chunk = records[i : i + BATCH_SIZE]
         try:
             supabase.table("hackathons").upsert(chunk, on_conflict="url").execute()
         except Exception as e:
-            print(f"    ✗  Upsert batch {i // BATCH_SIZE + 1} failed: {e}")
+            _fail(f"Upsert batch {i // BATCH_SIZE + 1} failed: {e}")
 
-    print(f"    ✓  {new_count} new  ·  {updated_count} updated  ·  {deleted} removed")
+    _ok(f"{new_count} new  ·  {updated_count} updated  ·  {deleted} removed")
     return new_count, updated_count, deleted
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCHOLARSHIP SAVE — UPSERT + CLEANUP
+#  SCHOLARSHIP SAVE  (upsert + cleanup)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _upsert_scholarships(df: pd.DataFrame) -> tuple:
+def _save_scholarships(df: pd.DataFrame) -> tuple[int, int, int]:
     if df is None or df.empty:
-        print("    ⚠  No scholarship data to save.")
+        _warn("No scholarship data to save.")
         return 0, 0, 0
 
     df = df.copy()
@@ -179,7 +215,7 @@ def _upsert_scholarships(df: pd.DataFrame) -> tuple:
         "category", "provider", "logo_url", "detail_url",
         "mode", "scraped_at",
     ]
-    df = df[[c for c in keep_cols if c in df.columns]]
+    df      = df[[c for c in keep_cols if c in df.columns]]
     records = df.to_dict(orient="records")
 
     cleaned = [
@@ -189,7 +225,7 @@ def _upsert_scholarships(df: pd.DataFrame) -> tuple:
     cleaned = [r for r in cleaned if r.get("detail_url")]
 
     if not cleaned:
-        print("    ⚠  All records missing detail_url.")
+        _warn("All records missing detail_url — nothing to save.")
         return 0, 0, 0
 
     current_urls = {r["detail_url"] for r in cleaned}
@@ -198,7 +234,7 @@ def _upsert_scholarships(df: pd.DataFrame) -> tuple:
         res           = supabase.table("scholarships").select("detail_url").execute()
         existing_urls = {r["detail_url"] for r in (res.data or [])}
     except Exception as e:
-        print(f"    ⚠  Could not read existing scholarships: {e}")
+        _warn(f"Could not read existing scholarships: {e}")
         existing_urls = set()
 
     new_count     = len(current_urls - existing_urls)
@@ -212,69 +248,18 @@ def _upsert_scholarships(df: pd.DataFrame) -> tuple:
                 chunk = to_delete[i : i + 200]
                 supabase.table("scholarships").delete().in_("detail_url", chunk).execute()
                 deleted += len(chunk)
-            print(f"    🗑  Removed {deleted} expired scholarships")
+            print(f"  🗑  Removed {deleted} expired scholarships")
         except Exception as e:
-            print(f"    ⚠  Scholarship cleanup failed (non-fatal): {e}")
+            _warn(f"Scholarship cleanup failed (non-fatal): {e}")
 
     for i in range(0, len(cleaned), BATCH_SIZE):
         chunk = cleaned[i : i + BATCH_SIZE]
         try:
             supabase.table("scholarships").upsert(chunk, on_conflict="detail_url").execute()
         except Exception as e:
-            print(f"    ✗  Upsert batch {i // BATCH_SIZE + 1} failed: {e}")
+            _fail(f"Upsert batch {i // BATCH_SIZE + 1} failed: {e}")
 
-    print(f"    ✓  {new_count} new  ·  {updated_count} updated  ·  {deleted} removed")
-    return new_count, updated_count, deleted
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  NEWS SAVE — UPSERT (keep last 7 days, delete older)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _save_tech_news(records: list) -> tuple:
-    """
-    Upserts today's 25 news items.
-    Deletes records older than 7 days to keep the table lean.
-    Returns (new, updated, deleted).
-    """
-    if not records:
-        print("    ⚠  No news records to save.")
-        return 0, 0, 0
-
-    current_urls = {r["url"] for r in records}
-
-    # Snapshot existing
-    try:
-        res           = supabase.table("tech_news").select("url").execute()
-        existing_urls = {r["url"] for r in (res.data or [])}
-    except Exception as e:
-        print(f"    ⚠  Could not read existing news: {e}")
-        existing_urls = set()
-
-    new_count     = len(current_urls - existing_urls)
-    updated_count = len(current_urls & existing_urls)
-
-    # Delete news older than 7 days
-    deleted = 0
-    try:
-        from datetime import timedelta
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        res = supabase.table("tech_news").delete().lt("scraped_at", cutoff).execute()
-        deleted = len(res.data or [])
-        if deleted:
-            print(f"    🗑  Removed {deleted} news items older than 7 days")
-    except Exception as e:
-        print(f"    ⚠  Old news cleanup failed (non-fatal): {e}")
-
-    # Upsert today's batch
-    for i in range(0, len(records), BATCH_SIZE):
-        chunk = records[i : i + BATCH_SIZE]
-        try:
-            supabase.table("tech_news").upsert(chunk, on_conflict="url").execute()
-        except Exception as e:
-            print(f"    ✗  News upsert batch {i // BATCH_SIZE + 1} failed: {e}")
-
-    print(f"    ✓  {new_count} new  ·  {updated_count} updated  ·  {deleted} old removed")
+    _ok(f"{new_count} new  ·  {updated_count} updated  ·  {deleted} removed")
     return new_count, updated_count, deleted
 
 
@@ -282,7 +267,7 @@ def _save_tech_news(records: list) -> tuple:
 #  INDIVIDUAL SCRAPER RUNNERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _run_unstop_hackathons() -> tuple:
+def _run_unstop_hackathons() -> tuple[int, int, int]:
     async def job():
         data = await unstop_fetch(max_pages=20)
         if not data:
@@ -290,30 +275,30 @@ def _run_unstop_hackathons() -> tuple:
         saved   = unstop_hack_save(data)
         current = {h.get("seo_url", "") for h in data if h.get("seo_url")}
         deleted = _cleanup("hackathons", "unstop", current)
-        print(f"    ✓  {saved} inserted  ·  {deleted} removed")
+        _ok(f"{saved} inserted  ·  {deleted} removed")
         return saved, 0, deleted
     return asyncio.run(job())
 
 
-def _run_devfolio() -> tuple:
+def _run_devfolio() -> tuple[int, int, int]:
     async def job():
         data = await devfolio_fetch(max_scrolls=20)
-        return _upsert_and_clean_devfolio(data)
+        return _save_devfolio(data)
     return asyncio.run(job())
 
 
-def _run_devpost() -> tuple:
+def _run_devpost() -> tuple[int, int, int]:
     data = devpost_fetch(max_pages=60)
     if not data:
         return 0, 0, 0
     saved   = devpost_save(data)
     current = {h.get("url", "") for h in data if h.get("url")}
     deleted = _cleanup("hackathons", "devpost", current)
-    print(f"    ✓  {saved} inserted  ·  {deleted} removed")
+    _ok(f"{saved} inserted  ·  {deleted} removed")
     return saved, 0, deleted
 
 
-def _run_hackerearth() -> tuple:
+def _run_hackerearth() -> tuple[int, int, int]:
     data = he_fetch()
     if not data:
         return 0, 0, 0
@@ -326,11 +311,11 @@ def _run_hackerearth() -> tuple:
         if url:
             current.add(url)
     deleted = _cleanup("hackathons", "hackerearth", current)
-    print(f"    ✓  {saved} inserted  ·  {deleted} removed")
+    _ok(f"{saved} inserted  ·  {deleted} removed")
     return saved, 0, deleted
 
 
-def _run_unstop_internships() -> tuple:
+def _run_unstop_internships() -> tuple[int, int, int]:
     async def job():
         data = await unstop_intern_fetch(max_pages=50)
         if not data:
@@ -338,12 +323,12 @@ def _run_unstop_internships() -> tuple:
         saved   = unstop_intern_save(data)
         current = {item.get("seo_url", "") for item in data if item.get("seo_url")}
         deleted = _cleanup("internships", "unstop", current)
-        print(f"    ✓  {saved} inserted  ·  {deleted} removed")
+        _ok(f"{saved} inserted  ·  {deleted} removed")
         return saved, 0, deleted
     return asyncio.run(job())
 
 
-def _run_buddy4study() -> tuple:
+def _run_buddy4study() -> tuple[int, int, int]:
     async def job():
         return await buddy_main(
             modes    = ["OPEN", "CLOSED", "ALWAYS_OPEN"],
@@ -354,38 +339,41 @@ def _run_buddy4study() -> tuple:
     df = asyncio.run(job())
     if df is not None and not df.empty and "mode" in df.columns:
         breakdown = df["mode"].value_counts().to_dict()
-        print(f"    Fetched {len(df)} scholarships — {breakdown}")
-    return _upsert_scholarships(df)
+        print(f"  Fetched {len(df)} scholarships  {breakdown}")
+    return _save_scholarships(df)
 
 
-def _run_linkedin_jobs() -> tuple:
-    """Trigger LinkedIn Jobs Apify task, wait for completion, upsert to jobs table."""
+def _run_linkedin_jobs() -> tuple[int, int, int]:
+    if not os.environ.get("APIFY_TOKEN"):
+        _warn("Skipped — APIFY_TOKEN not set")
+        return 0, 0, 0
     raw = linkedin_fetch()
     if not raw:
+        _warn("No data returned from Apify")
         return 0, 0, 0
-    return linkedin_save(raw)
+    new, updated, deleted = linkedin_save(raw)
+    _ok(f"{new} new  ·  {updated} updated  ·  {deleted} removed")
+    return new, updated, deleted
 
 
-def _run_indeed_jobs() -> tuple:
-    """Trigger Indeed Jobs Apify task, wait for completion, upsert to jobs table."""
+def _run_indeed_jobs() -> tuple[int, int, int]:
+    if not os.environ.get("APIFY_TOKEN"):
+        _warn("Skipped — APIFY_TOKEN not set")
+        return 0, 0, 0
     raw = indeed_fetch()
     if not raw:
+        _warn("No data returned from Apify")
         return 0, 0, 0
-    return indeed_save(raw)
-
-
-def _run_tech_news() -> tuple:
-    records = fetch_tech_news()
-    print(f"    Fetched {len(records)} news items from HackerNews")
-    return _save_tech_news(records)
+    new, updated, deleted = indeed_save(raw)
+    _ok(f"{new} new  ·  {updated} updated  ·  {deleted} removed")
+    return new, updated, deleted
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCRAPER REGISTRIES
+#  SCRAPER REGISTRY  (runs every 6 hours)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Runs every 6 hours
-SCRAPERS_6H = [
+SCRAPERS = [
     ("Unstop",       "Hackathons",   _run_unstop_hackathons),
     ("Devfolio",     "Hackathons",   _run_devfolio),
     ("Devpost",      "Hackathons",   _run_devpost),
@@ -396,57 +384,50 @@ SCRAPERS_6H = [
     ("Indeed",       "Jobs",         _run_indeed_jobs),
 ]
 
-# Runs once daily at 06:00 IST
-SCRAPERS_DAILY = [
-    ("HackerNews",   "Tech News",    _run_tech_news),
-]
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ISOLATED RUNNER WRAPPER
+#  ISOLATED RUNNER  (catches exceptions so one failure doesn't abort the rest)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _run_isolated(index: int, total: int, name: str, category: str, fn) -> tuple | None:
-    print(_section(index, total, name, category))
+def _run_isolated(
+    index: int, total: int, name: str, category: str, fn
+) -> tuple[int, int, int] | None:
+    _section(index, total, name, category)
     t0 = datetime.now()
     try:
         result = fn()
-        print(f"    ⏱  {_elapsed(t0)}s")
+        print(f"  Done in {_elapsed(t0)}")
         return result
     except Exception as exc:
-        secs = _elapsed(t0)
-        print(f"\n    ❌  {name} ({category}) FAILED after {secs}s")
-        print(f"    Error : {exc}")
-        print("    Traceback:")
+        _fail(f"{name} ({category}) failed after {_elapsed(t0)}: {exc}")
         traceback.print_exc()
-        print()
         return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MASTER JOBS
+#  MASTER JOB
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_all_scrapers():
-    """Runs hackathons + internships + scholarships + jobs every 6 hours."""
+def run_all_scrapers() -> None:
     global _run_count
     _run_count += 1
 
+    ts    = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
     start = datetime.now()
-    ts    = start.strftime("%Y-%m-%d  %H:%M:%S")
-    print(f"\n{_banner(f'RUN #{_run_count}  ·  {ts}')}")
+    _banner(f"RUN #{_run_count}   {ts}")
 
-    category_totals: dict = {}
-    failed_scrapers: list = []
+    # Pre-populate all categories so every row always appears in the summary
+    category_totals: dict[str, dict] = {}
+    for _, cat, _ in SCRAPERS:
+        if cat not in category_totals:
+            category_totals[cat] = {"new": 0, "updated": 0, "removed": 0}
 
-    for i, (name, category, fn) in enumerate(SCRAPERS_6H, 1):
-        result = _run_isolated(i, len(SCRAPERS_6H), name, category, fn)
+    failed: list[str] = []
 
-        if category not in category_totals:
-            category_totals[category] = {"new": 0, "updated": 0, "removed": 0}
-
+    for i, (name, category, fn) in enumerate(SCRAPERS, 1):
+        result = _run_isolated(i, len(SCRAPERS), name, category, fn)
         if result is None:
-            failed_scrapers.append(f"{name} ({category})")
+            failed.append(f"{name} ({category})")
         else:
             new, updated, removed = result
             category_totals[category]["new"]     += new
@@ -456,39 +437,21 @@ def run_all_scrapers():
     elapsed = round((datetime.now() - start).total_seconds())
     col_w   = max(len(c) for c in category_totals)
 
-    print(f"\n{_banner(f'DONE  ·  {elapsed}s total')}")
-    for category, t in category_totals.items():
+    _banner(f"SUMMARY   {elapsed}s total")
+    for cat, t in category_totals.items():
         print(
-            f"  {category:<{col_w}}  "
-            f"{t['new']:>4} new  ·  "
-            f"{t['updated']:>4} updated  ·  "
+            f"  {cat:<{col_w}}   "
+            f"{t['new']:>4} new   "
+            f"{t['updated']:>4} updated   "
             f"{t['removed']:>3} removed"
         )
-    if failed_scrapers:
-        print(f"\n  ⚠  Failed scrapers (all others ran fine):")
-        for s in failed_scrapers:
-            print(f"     • {s}")
-    print(f"\n  Next scraper run in 6 hours.")
-    print(f"{'═' * W}\n")
 
+    if failed:
+        print(f"\n  Failed scrapers:")
+        for s in failed:
+            print(f"    ✗  {s}")
 
-def run_news():
-    """Runs the tech news job — called daily at 06:00 IST."""
-    start = datetime.now()
-    ts    = start.strftime("%Y-%m-%d  %H:%M:%S")
-    print(f"\n{_banner(f'DAILY NEWS  ·  {ts}')}")
-
-    result = _run_isolated(1, 1, "HackerNews", "Tech News", _run_tech_news)
-
-    elapsed = round((datetime.now() - start).total_seconds())
-    print(f"\n{_banner(f'NEWS DONE  ·  {elapsed}s total')}")
-    if result:
-        new, updated, removed = result
-        print(f"  Tech News  {new:>3} new  ·  {updated:>3} updated  ·  {removed:>3} old removed")
-    else:
-        print("  ⚠  News run failed.")
-    print(f"\n  Next news run tomorrow at 06:00 IST.")
-    print(f"{'═' * W}\n")
+    print(f"\n  Next run in 6 hours.\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -496,49 +459,34 @@ def run_news():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(_banner("XSHARE MASTER SCHEDULER  v4"))
+    _banner("xShare Scheduler  v5")
     print()
-    print("  Jobs")
-    print("    Every 6 h    : Unstop · Devfolio · Devpost · HackerEarth")
-    print("                   Unstop Internships · Buddy4Study Scholarships")
-    print("                   LinkedIn Jobs · Indeed Jobs  (via Apify)")
-    print("    Daily 06:00  : HackerNews Top 25 Tech News (AI-summarised)")
+    print("  Schedule:  every 6 hours")
+    print("  Sources:   Unstop · Devfolio · Devpost · HackerEarth")
+    print("             Unstop Internships · Buddy4Study Scholarships")
+    print("             LinkedIn Jobs · Indeed Jobs  (Apify)")
     print()
-    print("  Timezone : Asia/Kolkata")
-    print()
-    print("  Required env vars: SUPABASE_URL  SUPABASE_KEY  ANTHROPIC_API_KEY  APIFY_TOKEN")
-    print()
+    print("  Timezone:  Asia/Kolkata")
 
-    # Run everything immediately on startup
+    _check_env()
+
+    # Run once immediately on startup
     run_all_scrapers()
-    run_news()
 
     scheduler = BlockingScheduler(timezone="Asia/Kolkata")
-
-    # Hackathons + Internships + Scholarships + Jobs — every 6 hours
     scheduler.add_job(
         run_all_scrapers,
         IntervalTrigger(hours=6),
         id            = "xshare_6h",
-        name          = "xShare Scrapers — Every 6 Hours",
+        name          = "xShare — Every 6 Hours",
         max_instances = 1,
         coalesce      = True,
     )
 
-    # Tech News — daily at 06:00 IST
-    scheduler.add_job(
-        run_news,
-        CronTrigger(hour=6, minute=0, timezone="Asia/Kolkata"),
-        id            = "xshare_news_daily",
-        name          = "xShare Tech News — Daily 06:00 IST",
-        max_instances = 1,
-        coalesce      = True,
-    )
-
-    print("Scheduler armed — press Ctrl+C to stop.\n")
+    print(f"  Scheduler armed.  Press Ctrl+C to stop.\n")
 
     try:
         scheduler.start()
     except KeyboardInterrupt:
-        print("\nScheduler stopped.")
+        print("\nStopped.")
         scheduler.shutdown()
