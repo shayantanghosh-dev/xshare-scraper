@@ -1,5 +1,5 @@
 """
-xShare Master Scheduler  (v6)
+xShare Master Scheduler  (v7)
 ==============================
 Single entry point — runs all scrapers on a fixed schedule.
 
@@ -7,7 +7,13 @@ Single entry point — runs all scrapers on a fixed schedule.
     Hackathons   → Unstop, Devfolio, Devpost, HackerEarth
     Internships  → Unstop
     Scholarships → Buddy4Study
-    Jobs         → LinkedIn (4 role tasks), Indeed  (via Apify — requires APIFY_TOKEN)
+    Jobs         → LinkedIn (4 role tasks merged into 1 save),
+                   Indeed  (via Apify — requires APIFY_TOKEN)
+
+v7 change: LinkedIn jobs are now deduped across the 4 role tasks
+in-memory before being written. Each job stores the list of roles
+it matched in the `matched_roles` text[] column, so the frontend
+keeps per-role filtering while the DB stops thrashing.
 
 Environment variables required:
   SUPABASE_URL
@@ -77,6 +83,10 @@ LINKEDIN_TASKS = {
     "Data Analyst":         "shayantan_ghosh-dev~linkedin-jobs-data-analyst-india-daily",
     "Frontend Developer":   "shayantan_ghosh-dev~linkedin-jobs-frontend-developer-india-daily",
 }
+
+# Combined slug under which all merged LinkedIn jobs live in the DB.
+# Cleanup is scoped to this slug only — won't touch Indeed or anything else.
+LINKEDIN_COMBINED_SLUG = "linkedin-india-all"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -348,36 +358,73 @@ def _run_buddy4study() -> tuple[int, int, int]:
     return _save_scholarships(df)
 
 
-# ── LinkedIn: generic helper ───────────────────────────────────────────────────
+# ── LinkedIn: combined runner ─────────────────────────────────────────────────
+#
+# Fetches all 4 role tasks, dedupes by URL across them, and tags each surviving
+# job with the list of roles it matched. The save is done once under a single
+# combined task_slug so cleanup is consistent and the DB no longer thrashes the
+# task_slug field for jobs that appear in multiple role searches.
 
-def _run_linkedin_task(label: str, task_id: str) -> tuple[int, int, int]:
+def _run_linkedin_all() -> tuple[int, int, int]:
     if not os.environ.get("APIFY_TOKEN"):
         _warn("Skipped — APIFY_TOKEN not set")
         return 0, 0, 0
-    print(f"  Task: {label}")
-    raw = linkedin_fetch(task_id=task_id)
-    if not raw:
-        _warn("No data returned from Apify")
+
+    combined: dict[str, tuple[dict, list[str]]] = {}   # url → (raw_item, [roles])
+    fetched_total = 0
+
+    for role, task_id in LINKEDIN_TASKS.items():
+        print(f"  Task: {role}")
+        try:
+            raw = linkedin_fetch(task_id=task_id)
+        except Exception as e:
+            _warn(f"    {role} fetch failed: {e}")
+            continue
+
+        if not raw:
+            _warn(f"    {role}: no data returned")
+            continue
+
+        fetched_total += len(raw)
+        added = 0
+        for item in raw:
+            url = (
+                item.get("jobUrl")
+                or item.get("url")
+                or item.get("applyUrl")
+                or ""
+            )
+            url = url.strip() if isinstance(url, str) else ""
+            if not url:
+                continue
+            if url in combined:
+                # Existing job — just record that this role also matched it
+                if role not in combined[url][1]:
+                    combined[url][1].append(role)
+            else:
+                combined[url] = (item, [role])
+                added += 1
+        print(f"    → {len(raw)} fetched, {added} unique-after-merge")
+
+    if not combined:
+        _warn("  No LinkedIn jobs across any task")
         return 0, 0, 0
-    # Pass task_id so save_to_supabase scopes the cleanup to this task only
-    new, updated, deleted = linkedin_save(raw, task_id=task_id)
+
+    # Attach matched_roles to each raw item — linkedin_jobs._normalise reads it
+    raw_items = []
+    for url, (item, roles) in combined.items():
+        item["_matched_roles"] = roles
+        raw_items.append(item)
+
+    print(
+        f"  Combined: {len(raw_items)} unique jobs "
+        f"from {fetched_total} fetched across {len(LINKEDIN_TASKS)} tasks "
+        f"({fetched_total - len(raw_items)} cross-task duplicates merged)"
+    )
+
+    new, updated, deleted = linkedin_save(raw_items, task_id=LINKEDIN_COMBINED_SLUG)
     _ok(f"{new} new  ·  {updated} updated  ·  {deleted} removed")
     return new, updated, deleted
-
-
-# ── LinkedIn: one runner per role ──────────────────────────────────────────────
-
-def _run_linkedin_software_engineer() -> tuple[int, int, int]:
-    return _run_linkedin_task("Software Engineer", LINKEDIN_TASKS["Software Engineer"])
-
-def _run_linkedin_fullstack() -> tuple[int, int, int]:
-    return _run_linkedin_task("Full Stack Developer", LINKEDIN_TASKS["Full Stack Developer"])
-
-def _run_linkedin_data_analyst() -> tuple[int, int, int]:
-    return _run_linkedin_task("Data Analyst", LINKEDIN_TASKS["Data Analyst"])
-
-def _run_linkedin_frontend() -> tuple[int, int, int]:
-    return _run_linkedin_task("Frontend Developer", LINKEDIN_TASKS["Frontend Developer"])
 
 
 # ── Indeed ─────────────────────────────────────────────────────────────────────
@@ -400,17 +447,14 @@ def _run_indeed_jobs() -> tuple[int, int, int]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 SCRAPERS = [
-    ("Unstop",                       "Hackathons",   _run_unstop_hackathons),
-    ("Devfolio",                     "Hackathons",   _run_devfolio),
-    ("Devpost",                      "Hackathons",   _run_devpost),
-    ("HackerEarth",                  "Hackathons",   _run_hackerearth),
-    ("Unstop",                       "Internships",  _run_unstop_internships),
-    ("Buddy4Study",                  "Scholarships", _run_buddy4study),
-    ("LinkedIn (Software Engineer)", "Jobs",         _run_linkedin_software_engineer),
-    ("LinkedIn (Full Stack Dev)",    "Jobs",         _run_linkedin_fullstack),
-    ("LinkedIn (Data Analyst)",      "Jobs",         _run_linkedin_data_analyst),
-    ("LinkedIn (Frontend Dev)",      "Jobs",         _run_linkedin_frontend),
-    ("Indeed",                       "Jobs",         _run_indeed_jobs),
+    ("Unstop",          "Hackathons",   _run_unstop_hackathons),
+    ("Devfolio",        "Hackathons",   _run_devfolio),
+    ("Devpost",         "Hackathons",   _run_devpost),
+    ("HackerEarth",     "Hackathons",   _run_hackerearth),
+    ("Unstop",          "Internships",  _run_unstop_internships),
+    ("Buddy4Study",     "Scholarships", _run_buddy4study),
+    ("LinkedIn (all)",  "Jobs",         _run_linkedin_all),
+    ("Indeed",          "Jobs",         _run_indeed_jobs),
 ]
 
 
@@ -487,12 +531,12 @@ def run_all_scrapers() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    _banner("xShare Scheduler  v6")
+    _banner("xShare Scheduler  v7")
     print()
     print("  Schedule:  every 6 hours")
     print("  Sources:   Unstop · Devfolio · Devpost · HackerEarth")
     print("             Unstop Internships · Buddy4Study Scholarships")
-    print("             LinkedIn Jobs (4 roles) · Indeed Jobs  (Apify)")
+    print("             LinkedIn Jobs (4 roles merged) · Indeed Jobs  (Apify)")
     print()
     print("  Timezone:  Asia/Kolkata")
 
