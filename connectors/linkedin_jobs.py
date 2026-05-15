@@ -165,7 +165,7 @@ def _normalise(item: dict, slug: str) -> dict | None:
 
     return {
         "source":           SOURCE,
-        "task_slug":        slug,          # scopes stale-URL cleanup per task
+        "task_slug":        slug,
         "title":            title,
         "company":          company,
         "location":         location or "India",
@@ -190,16 +190,30 @@ def save_to_supabase(
     if not raw_items:
         return 0, 0, 0
 
-    slug    = _task_slug(task_id)
-    records = [r for r in (_normalise(i, slug) for i in raw_items) if r]
-    if not records:
+    slug = _task_slug(task_id)
+
+    # Normalise all items
+    normalised = [r for r in (_normalise(i, slug) for i in raw_items) if r]
+    if not normalised:
         log.warning("  No valid records after normalisation.")
         return 0, 0, 0
 
+    # ── Deduplicate by URL within this batch ──────────────────────────────────
+    # Apify occasionally returns the same job URL twice. A single upsert batch
+    # with duplicate conflict keys causes a Postgres 21000 error. Keep the last
+    # occurrence (most recently seen in the dataset).
+    seen: dict[str, dict] = {}
+    for r in normalised:
+        seen[r["url"]] = r
+    records = list(seen.values())
+
+    dupes = len(normalised) - len(records)
+    if dupes:
+        print(f"  ⚠  Dropped {dupes} duplicate URL(s) from batch")
+
     current_urls = {r["url"] for r in records}
 
-    # Scope the existing-URL query to THIS task's slug only — never touch
-    # records belonging to other LinkedIn tasks.
+    # Scope the existing-URL query to THIS task's slug only
     try:
         res = (
             supabase.table(TABLE)
