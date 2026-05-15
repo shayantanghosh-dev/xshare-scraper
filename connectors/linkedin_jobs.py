@@ -6,6 +6,11 @@ normalises, and upserts into the `jobs` Supabase table.
 Each role-specific task is scoped by `task_slug` so tasks never
 delete each other's records during the stale-URL cleanup step.
 
+When multiple role tasks find the same URL, the scheduler dedupes
+in memory and passes a `_matched_roles` list on each raw item.
+That list is stored in the `matched_roles` text[] column so the
+frontend can filter by role without duplicating rows.
+
 Env vars required:
   APIFY_TOKEN
   SUPABASE_URL
@@ -163,9 +168,16 @@ def _normalise(item: dict, slug: str) -> dict | None:
         item.get("postedAt") or item.get("postedDate") or item.get("publishedAt", "")
     )
 
+    # Roles this job matched across LinkedIn searches. The scheduler attaches
+    # `_matched_roles` after merging the 4 role-task results by URL. If a
+    # caller invokes the connector directly (without merging), fall back to
+    # the task_slug so the field is always populated.
+    matched_roles = item.get("_matched_roles") or [slug]
+
     return {
         "source":           SOURCE,
         "task_slug":        slug,
+        "matched_roles":    matched_roles,
         "title":            title,
         "company":          company,
         "location":         location or "India",
@@ -190,30 +202,16 @@ def save_to_supabase(
     if not raw_items:
         return 0, 0, 0
 
-    slug = _task_slug(task_id)
-
-    # Normalise all items
-    normalised = [r for r in (_normalise(i, slug) for i in raw_items) if r]
-    if not normalised:
+    slug    = _task_slug(task_id)
+    records = [r for r in (_normalise(i, slug) for i in raw_items) if r]
+    if not records:
         log.warning("  No valid records after normalisation.")
         return 0, 0, 0
 
-    # ── Deduplicate by URL within this batch ──────────────────────────────────
-    # Apify occasionally returns the same job URL twice. A single upsert batch
-    # with duplicate conflict keys causes a Postgres 21000 error. Keep the last
-    # occurrence (most recently seen in the dataset).
-    seen: dict[str, dict] = {}
-    for r in normalised:
-        seen[r["url"]] = r
-    records = list(seen.values())
-
-    dupes = len(normalised) - len(records)
-    if dupes:
-        print(f"  ⚠  Dropped {dupes} duplicate URL(s) from batch")
-
     current_urls = {r["url"] for r in records}
 
-    # Scope the existing-URL query to THIS task's slug only
+    # Scope the existing-URL query to THIS task's slug only — never touch
+    # records belonging to other LinkedIn tasks.
     try:
         res = (
             supabase.table(TABLE)
