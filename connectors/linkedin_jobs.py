@@ -11,6 +11,16 @@ in memory and passes a `_matched_roles` list on each raw item.
 That list is stored in the `matched_roles` text[] column so the
 frontend can filter by role without duplicating rows.
 
+New fields extracted (v2):
+  work_mode        — "Remote" / "Hybrid" / "On-site" (parsed from workType/location)
+  company_url      — LinkedIn company page URL
+  recruiter_name   — hiring recruiter's display name
+  recruiter_url    — recruiter's LinkedIn profile URL
+  sector           — industry / sector string (e.g. "Financial Services")
+  apply_type       — "EASY_APPLY" or "EXTERNAL"
+  description      — full plain-text job description (no HTML)
+  tagline          — first ~300 chars of description (unchanged, for card previews)
+
 Env vars required:
   APIFY_TOKEN
   SUPABASE_URL
@@ -63,13 +73,12 @@ def _clean(v) -> str:
 def _clean_text(v) -> str:
     """
     Strip HTML tags and collapse all whitespace (including \\n \\t) to
-    single spaces. Used for description → tagline so the tagline never
-    contains raw newlines or HTML markup.
+    single spaces. Used for description and tagline fields.
     """
     if not v:
         return ""
     s = str(v)
-    s = re.sub(r"<[^>]+>", " ", s)      # strip HTML
+    s = re.sub(r"<[^>]+>", " ", s)      # strip HTML tags
     s = re.sub(r"\s+", " ", s).strip()  # collapse whitespace / newlines
     return s
 
@@ -78,10 +87,6 @@ def _task_slug(task_id: str) -> str:
        → 'linkedin-jobs-data-analyst-india-daily'
     """
     return task_id.split("~", 1)[-1] if "~" in task_id else task_id
-
-def _normalize_remote(location: str, work_type: str) -> bool:
-    combined = f"{location} {work_type}".lower()
-    return any(k in combined for k in ("remote", "hybrid", "virtual", "work from home"))
 
 
 # ── field extractors ─────────────────────────────────────────────────────────
@@ -98,14 +103,15 @@ def _extract_url(item: dict) -> str:
 def _extract_description(item: dict) -> str:
     """
     Description can be a plain string or a dict {text: '...', html: '...'}.
-    Returns cleaned plain text (no HTML, no raw newlines).
+    Returns full cleaned plain text (no HTML, no raw newlines).
     """
-    for key in ("descriptionText", "jobDescription", "description",
+    for key in ("description", "descriptionText", "jobDescription",
                 "summary", "content", "jobContent"):
         val = item.get(key)
         if not val:
             continue
         if isinstance(val, dict):
+            # Prefer plain text; fall back to stripping HTML
             text = val.get("text") or val.get("html") or ""
             if text:
                 return _clean_text(text)
@@ -132,7 +138,7 @@ def _extract_experience(item: dict) -> str:
 def _extract_salary(item: dict) -> str:
     """
     Salary can be:
-      - a plain string   "₹10L – ₹20L/yr"
+      - a plain string   "$250,000/yr – $800,000/yr"
       - a dict           {min/from, max/to, currency, period}
     """
     for key in ("salary", "salaryRange", "compensation", "salaryInfo",
@@ -188,31 +194,109 @@ def _extract_skills(item: dict) -> list[str]:
 
 
 def _extract_posted_at(item: dict) -> str:
-    """Date the job was posted; try every field name LinkedIn actors use."""
-    for key in ("postedAt", "listedAt", "publishedAt", "datePosted",
-                "postedDate", "createdAt", "date", "postDate"):
+    """
+    Date the job was posted. Prefer exact ISO/date strings over relative
+    strings like '1 day ago'. Falls back to postedTimeAgo if nothing else
+    is available.
+    """
+    # Exact date fields first
+    for key in ("postedDate", "datePosted", "publishedAt", "listedAt",
+                "createdAt", "date", "postDate", "postedAt"):
         val = _clean(item.get(key, ""))
         if val and val.lower() not in ("null", "none"):
             return val
+    # Relative string as last resort
+    val = _clean(item.get("postedTimeAgo", ""))
+    if val and val.lower() not in ("null", "none"):
+        return val
     return ""
 
 
 def _extract_applicants(item: dict) -> str:
-    """Number of applicants; returns a formatted string or ''."""
-    for key in ("applicantCount", "numberOfApplicants", "applies",
-                "totalApplicants", "applicants", "applyCount"):
+    """
+    Number of applicants.
+    LinkedIn actors may return '64 applicants' (string) or an int.
+    """
+    for key in ("applicationsCount", "applicantCount", "numberOfApplicants",
+                "applies", "totalApplicants", "applicants", "applyCount"):
         val = item.get(key)
         if val is None:
             continue
+        if isinstance(val, str):
+            s = val.strip()
+            if s and s.lower() not in ("null", "none", "0"):
+                return s
         try:
             n = int(val)
             if n > 0:
                 return f"{n:,}"
         except (ValueError, TypeError):
-            s = _clean(str(val))
-            if s and s.lower() not in ("null", "none", "0"):
-                return s
+            pass
     return ""
+
+
+def _extract_work_mode(item: dict) -> str:
+    """
+    Classify the job as Remote / Hybrid / On-site.
+    Checks workType, workplaceType, and location string.
+    """
+    for key in ("workType", "workplaceType", "remoteAllowed", "workMode"):
+        val = _clean(item.get(key, "")).lower()
+        if not val or val in ("null", "none"):
+            continue
+        if "remote" in val:
+            return "Remote"
+        if "hybrid" in val:
+            return "Hybrid"
+        if "on-site" in val or "onsite" in val or "office" in val:
+            return "On-site"
+
+    # Fall back: scan location string
+    location = _clean(item.get("location", "")).lower()
+    if "remote" in location:
+        return "Remote"
+    if "hybrid" in location:
+        return "Hybrid"
+
+    return "On-site"   # default for LinkedIn India jobs
+
+
+def _extract_company_url(item: dict) -> str:
+    """Company LinkedIn page URL."""
+    for key in ("companyUrl", "companyPageUrl", "companyLinkedinUrl"):
+        val = _clean(item.get(key, ""))
+        if val:
+            return val
+    return ""
+
+
+def _extract_recruiter(item: dict) -> tuple[str, str]:
+    """Returns (recruiter_name, recruiter_url)."""
+    name = _clean(item.get("recruiterName", ""))
+    url  = _clean(item.get("recruiterUrl", ""))
+    return name, url
+
+
+def _extract_sector(item: dict) -> str:
+    """Industry / sector string."""
+    for key in ("sector", "industry", "jobIndustry", "industries"):
+        val = item.get(key)
+        if not val:
+            continue
+        if isinstance(val, list):
+            parts = [_clean(v) for v in val if _clean(v)]
+            if parts:
+                return ", ".join(parts)
+        cleaned = _clean(val)
+        if cleaned and cleaned.lower() not in ("null", "none"):
+            return cleaned
+    return ""
+
+
+def _extract_apply_type(item: dict) -> str:
+    """EASY_APPLY or EXTERNAL."""
+    val = _clean(item.get("applyType", ""))
+    return val if val and val.lower() not in ("null", "none") else ""
 
 
 # ── Apify API calls ───────────────────────────────────────────────────────────
@@ -294,9 +378,10 @@ def _normalise(item: dict, slug: str) -> dict | None:
     if not title:
         return None
 
-    company   = _clean(item.get("companyName") or item.get("company", ""))
-    location  = _clean(item.get("location", ""))
-    work_type = _clean(item.get("workType") or item.get("workplaceType", ""))
+    company       = _clean(item.get("companyName") or item.get("company", ""))
+    location      = _clean(item.get("location", ""))
+    contract_type = _clean(item.get("contractType") or item.get("employmentType", ""))
+    matched_roles = item.get("_matched_roles") or [slug]
 
     description = _extract_description(item)
     tagline     = (
@@ -305,24 +390,45 @@ def _normalise(item: dict, slug: str) -> dict | None:
         else description
     )
 
-    contract_type = _clean(item.get("contractType") or item.get("employmentType", ""))
-    matched_roles = item.get("_matched_roles") or [slug]
+    recruiter_name, recruiter_url = _extract_recruiter(item)
 
     return {
+        # ── core identity ──────────────────────────────────────────────────
         "source":           SOURCE,
         "task_slug":        slug,
         "matched_roles":    matched_roles,
-        "title":            title,
-        "company":          company,
-        "location":         location or "India",
         "url":              url,
+
+        # ── job basics ─────────────────────────────────────────────────────
+        "title":            title,
         "tagline":          tagline,
+        "description":      description,
         "job_type":         contract_type or "Full-time",
-        "experience_level": _extract_experience(item),
-        "is_remote":        _normalize_remote(location, work_type),
+        "work_mode":        _extract_work_mode(item),
+
+        # ── company ────────────────────────────────────────────────────────
+        "company":          company,
+        "company_url":      _extract_company_url(item),
+        "sector":           _extract_sector(item),
+
+        # ── recruiter ──────────────────────────────────────────────────────
+        "recruiter_name":   recruiter_name,
+        "recruiter_url":    recruiter_url,
+
+        # ── location & remote ──────────────────────────────────────────────
+        "location":         location or "India",
+        "is_remote":        _extract_work_mode(item) in ("Remote", "Hybrid"),
+
+        # ── compensation & experience ──────────────────────────────────────
         "salary":           _extract_salary(item),
-        "skills":           _extract_skills(item),
+        "experience_level": _extract_experience(item),
+
+        # ── apply info ─────────────────────────────────────────────────────
+        "apply_type":       _extract_apply_type(item),
         "applicants":       _extract_applicants(item),
+
+        # ── skills & dates ─────────────────────────────────────────────────
+        "skills":           _extract_skills(item),
         "date_posted":      _extract_posted_at(item),
         "scraped_at":       datetime.now(timezone.utc).isoformat(),
     }
