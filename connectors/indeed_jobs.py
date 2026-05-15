@@ -3,6 +3,15 @@ Indeed Jobs — Apify connector
 Triggers the saved Apify task, polls until done, pulls dataset,
 normalises, and upserts into the `jobs` Supabase table.
 
+The Apify Indeed actor returns several nested / dict fields:
+  - company     → "employerName" string  (not "company")
+  - location    → dict {city, state, countryName, ...}  OR plain string
+  - description → dict {text: "...", html: "..."} OR plain string
+  - salary      → dict {min, max, currency, period}  OR plain string
+  - date_posted → "datePosted" (not "datePostedFormatted")
+
+All of these are handled defensively in the extractor functions.
+
 Env vars required:
   APIFY_TOKEN
   SUPABASE_URL
@@ -10,6 +19,7 @@ Env vars required:
 """
 
 import os
+import re
 import sys
 import time
 import logging
@@ -42,18 +52,204 @@ def _token() -> str:
     return t
 
 def _headers(token: str) -> dict:
-    """Use Authorization header instead of ?token= query param."""
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type":  "application/json",
     }
 
 def _clean(v) -> str:
+    """Stringify and strip; return '' for None/empty."""
     return str(v).strip() if v else ""
+
+def _clean_text(v) -> str:
+    """
+    Strip HTML tags and collapse all whitespace (including \\n \\t) to
+    single spaces. Used for description → tagline extraction.
+    """
+    if not v:
+        return ""
+    s = str(v)
+    s = re.sub(r"<[^>]+>", " ", s)      # strip HTML
+    s = re.sub(r"\s+", " ", s).strip()  # collapse whitespace / newlines
+    return s
 
 def _is_remote(location: str, job_type: str) -> bool:
     combined = f"{location} {job_type}".lower()
     return any(k in combined for k in ("remote", "hybrid", "work from home", "virtual"))
+
+
+# ── field extractors ─────────────────────────────────────────────────────────
+
+def _extract_company(item: dict) -> str:
+    """
+    The Apify Indeed actor stores the company under 'employerName'.
+    Fall back through several alternatives in case the schema varies.
+    """
+    for key in ("employerName", "employer", "company",
+                "companyName", "company_name", "hiringOrganization"):
+        val = item.get(key)
+        if not val:
+            continue
+        if isinstance(val, dict):
+            name = val.get("name") or val.get("companyName") or ""
+            if name:
+                return _clean(name)
+        else:
+            cleaned = _clean(val)
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def _extract_location(item: dict) -> str:
+    """
+    Location can be:
+      - a plain string  → use directly
+      - a dict {city, state, countryName, countryCode, ...}
+    """
+    for key in ("location", "jobLocation", "locationName", "jobCity"):
+        val = item.get(key)
+        if not val:
+            continue
+        if isinstance(val, str):
+            cleaned = val.strip()
+            if cleaned:
+                return cleaned
+        if isinstance(val, dict):
+            city    = _clean(val.get("city", ""))
+            state   = _clean(val.get("state", ""))
+            country = _clean(val.get("countryName", "") or val.get("countryCode", ""))
+            parts   = [p for p in (city, state) if p]
+            if parts:
+                return ", ".join(parts)
+            if country:
+                return country
+    return "India"
+
+
+def _extract_description(item: dict) -> str:
+    """
+    Description can be a plain string or a dict {text: '...', html: '...'}.
+    Returns cleaned plain text (no HTML, no raw newlines).
+    """
+    for key in ("description", "descriptionText", "jobDescription",
+                "summary", "jobContent", "fullDescription"):
+        val = item.get(key)
+        if not val:
+            continue
+        if isinstance(val, dict):
+            text = val.get("text") or val.get("html") or ""
+            if text:
+                return _clean_text(text)
+        else:
+            cleaned = _clean_text(val)
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def _extract_salary(item: dict) -> str:
+    """
+    Salary can be:
+      - a plain string
+      - a dict {from/min, to/max, currency, period}
+    """
+    for key in ("salary", "salaryRange", "compensation",
+                "salaryInfo", "salaryText", "pay"):
+        val = item.get(key)
+        if not val:
+            continue
+        if isinstance(val, str):
+            cleaned = val.strip()
+            if cleaned and cleaned.lower() not in ("null", "none", "0", ""):
+                return cleaned
+        if isinstance(val, dict):
+            lo  = val.get("from") or val.get("min") or val.get("minimum")
+            hi  = val.get("to")   or val.get("max") or val.get("maximum")
+            cur = val.get("currency", "₹")
+            per = (val.get("period") or val.get("type") or "").lower()
+            suffix = {
+                "monthly": "/mo", "yearly": "/yr",
+                "annual":  "/yr", "hourly": "/hr",
+            }.get(per, "")
+            if lo and hi:
+                return f"{cur}{int(lo):,} – {cur}{int(hi):,}{suffix}"
+            if hi:
+                return f"Up to {cur}{int(hi):,}{suffix}"
+            if lo:
+                return f"From {cur}{int(lo):,}{suffix}"
+    return "Not disclosed"
+
+
+def _extract_experience(item: dict) -> str:
+    """Experience level — Indeed actors use varying field names."""
+    for key in ("experienceLevel", "experience", "jobLevel",
+                "seniorityLevel", "seniority", "careerLevel",
+                "minimumExperience", "requiredExperience"):
+        val = item.get(key)
+        if not val:
+            continue
+        if isinstance(val, str):
+            cleaned = val.strip()
+            if cleaned and cleaned.lower() not in ("null", "none", ""):
+                return cleaned
+        if isinstance(val, (int, float)) and val > 0:
+            return f"{int(val)}+ years"
+    return ""
+
+
+def _extract_skills(item: dict) -> list[str]:
+    """Skills list — may be absent for Indeed; handle gracefully."""
+    for key in ("skills", "requiredSkills", "preferredSkills",
+                "jobSkills", "skillList", "qualifications"):
+        raw = item.get(key)
+        if not raw:
+            continue
+        if isinstance(raw, list) and raw:
+            result = []
+            for s in raw:
+                if isinstance(s, dict):
+                    name = _clean(s.get("name") or s.get("skill") or "")
+                elif isinstance(s, str):
+                    name = s.strip()
+                else:
+                    name = ""
+                if name:
+                    result.append(name)
+            if result:
+                return result
+        if isinstance(raw, str) and raw.strip():
+            return [s.strip() for s in raw.split(",") if s.strip()]
+    return []
+
+
+def _extract_posted_at(item: dict) -> str:
+    """Date the job was posted; try every field name Indeed actors use."""
+    for key in ("datePosted", "postedAt", "publishedAt", "date",
+                "postedDate", "datePostedFormatted", "postDate",
+                "created_at", "formattedDate"):
+        val = _clean(item.get(key, ""))
+        if val and val.lower() not in ("null", "none", ""):
+            return val
+    return ""
+
+
+def _extract_applicants(item: dict) -> str:
+    """Number of applicants (not always available on Indeed)."""
+    for key in ("numberOfApplicants", "applicantCount", "applies",
+                "totalApplicants", "applicants"):
+        val = item.get(key)
+        if val is None:
+            continue
+        try:
+            n = int(val)
+            if n > 0:
+                return f"{n:,}"
+        except (ValueError, TypeError):
+            s = _clean(str(val))
+            if s and s.lower() not in ("null", "none", "0"):
+                return s
+    return ""
 
 
 # ── Apify API calls ───────────────────────────────────────────────────────────
@@ -133,40 +329,39 @@ def _normalise(item: dict) -> dict | None:
     if not url:
         return None
 
-    title   = _clean(item.get("positionName") or item.get("title") or item.get("jobTitle", ""))
-    company = _clean(item.get("company") or item.get("companyName", ""))
+    title = _clean(
+        item.get("positionName") or item.get("title") or item.get("jobTitle", "")
+    )
     if not title:
         return None
 
-    location    = _clean(item.get("location") or item.get("jobLocation", ""))
-    job_type    = _clean(item.get("jobType") or item.get("contractType", ""))
-    salary      = _clean(item.get("salary") or item.get("salaryRange", ""))
-    description = _clean(item.get("description") or item.get("descriptionText", ""))
-    tagline     = description[:300].rsplit(" ", 1)[0] + "…" if len(description) > 300 else description
+    company     = _extract_company(item)
+    location    = _extract_location(item)
+    description = _extract_description(item)
+    salary      = _extract_salary(item)
 
-    posted_at = _clean(
-        item.get("datePostedFormatted") or item.get("postedAt") or item.get("publishedAt", "")
+    tagline = (
+        description[:300].rsplit(" ", 1)[0] + "…"
+        if len(description) > 300
+        else description
     )
 
-    skills_raw = item.get("skills") or []
-    if isinstance(skills_raw, list):
-        skills = [_clean(s) for s in skills_raw if s]
-    else:
-        skills = [s.strip() for s in str(skills_raw).split(",") if s.strip()]
+    job_type = _clean(item.get("jobType") or item.get("contractType", ""))
 
     return {
         "source":           SOURCE,
         "title":            title,
         "company":          company,
-        "location":         location or "India",
+        "location":         location,
         "url":              url,
         "tagline":          tagline,
         "job_type":         job_type or "Full-time",
-        "experience_level": _clean(item.get("experienceLevel", "")),
+        "experience_level": _extract_experience(item),
         "is_remote":        _is_remote(location, job_type),
-        "salary":           salary or "Not disclosed",
-        "skills":           skills,
-        "date_posted":      posted_at,
+        "salary":           salary,
+        "skills":           _extract_skills(item),
+        "applicants":       _extract_applicants(item),
+        "date_posted":      _extract_posted_at(item),
         "scraped_at":       datetime.now(timezone.utc).isoformat(),
     }
 
