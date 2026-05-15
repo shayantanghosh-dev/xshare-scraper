@@ -1,9 +1,9 @@
 """
-xShare Master Scheduler  (v3)
+xShare Master Scheduler  (v4)
 ==============================
 Single entry point — runs all scrapers on schedule.
 
-  Every 6 hours : Hackathons · Internships · Scholarships
+  Every 6 hours : Hackathons · Internships · Scholarships · Jobs
   Daily (06:00 IST) : Tech News (25 stories, AI-summarised)
 
 ──────────────────────────────────────────────────────────────
@@ -16,11 +16,13 @@ Single entry point — runs all scrapers on schedule.
      ADD CONSTRAINT internships_url_unique UNIQUE (url);
 
    -- tech_news table: run tech_news_schema.sql in Supabase SQL Editor
+   -- jobs table:      run jobs_schema.sql in Supabase SQL Editor
 
 Environment variables required:
    SUPABASE_URL
    SUPABASE_KEY
    ANTHROPIC_API_KEY   ← needed for news summaries
+   APIFY_TOKEN         ← needed for LinkedIn & Indeed jobs
 ──────────────────────────────────────────────────────────────
 """
 
@@ -56,12 +58,16 @@ from connectors.hackerearth        import fetch_hackathons  as he_fetch
 from connectors.unstop_internships import fetch_internships as unstop_intern_fetch
 from connectors.buddy              import main              as buddy_main
 from connectors.tech_news          import fetch_tech_news
+from connectors.linkedin_jobs      import fetch_jobs        as linkedin_fetch
+from connectors.indeed_jobs        import fetch_jobs        as indeed_fetch
 
 # ── Save functions from connectors ────────────────────────────────────────────
 from connectors.unstop             import save_to_supabase  as unstop_hack_save
 from connectors.devpost            import save_to_supabase  as devpost_save
 from connectors.hackerearth        import save_to_supabase  as he_save
 from connectors.unstop_internships import save_to_supabase  as unstop_intern_save
+from connectors.linkedin_jobs      import save_to_supabase  as linkedin_save
+from connectors.indeed_jobs        import save_to_supabase  as indeed_save
 
 from utils.supabase_client import supabase
 
@@ -352,6 +358,22 @@ def _run_buddy4study() -> tuple:
     return _upsert_scholarships(df)
 
 
+def _run_linkedin_jobs() -> tuple:
+    """Trigger LinkedIn Jobs Apify task, wait for completion, upsert to jobs table."""
+    raw = linkedin_fetch()
+    if not raw:
+        return 0, 0, 0
+    return linkedin_save(raw)
+
+
+def _run_indeed_jobs() -> tuple:
+    """Trigger Indeed Jobs Apify task, wait for completion, upsert to jobs table."""
+    raw = indeed_fetch()
+    if not raw:
+        return 0, 0, 0
+    return indeed_save(raw)
+
+
 def _run_tech_news() -> tuple:
     records = fetch_tech_news()
     print(f"    Fetched {len(records)} news items from HackerNews")
@@ -370,6 +392,8 @@ SCRAPERS_6H = [
     ("HackerEarth",  "Hackathons",   _run_hackerearth),
     ("Unstop",       "Internships",  _run_unstop_internships),
     ("Buddy4Study",  "Scholarships", _run_buddy4study),
+    ("LinkedIn",     "Jobs",         _run_linkedin_jobs),
+    ("Indeed",       "Jobs",         _run_indeed_jobs),
 ]
 
 # Runs once daily at 06:00 IST
@@ -404,7 +428,7 @@ def _run_isolated(index: int, total: int, name: str, category: str, fn) -> tuple
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_all_scrapers():
-    """Runs hackathons + internships + scholarships every 6 hours."""
+    """Runs hackathons + internships + scholarships + jobs every 6 hours."""
     global _run_count
     _run_count += 1
 
@@ -472,16 +496,17 @@ def run_news():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(_banner("XSHARE MASTER SCHEDULER  v3"))
+    print(_banner("XSHARE MASTER SCHEDULER  v4"))
     print()
     print("  Jobs")
     print("    Every 6 h    : Unstop · Devfolio · Devpost · HackerEarth")
     print("                   Unstop Internships · Buddy4Study Scholarships")
+    print("                   LinkedIn Jobs · Indeed Jobs  (via Apify)")
     print("    Daily 06:00  : HackerNews Top 25 Tech News (AI-summarised)")
     print()
     print("  Timezone : Asia/Kolkata")
     print()
-    print("  Required env vars: SUPABASE_URL  SUPABASE_KEY  ANTHROPIC_API_KEY")
+    print("  Required env vars: SUPABASE_URL  SUPABASE_KEY  ANTHROPIC_API_KEY  APIFY_TOKEN")
     print()
 
     # Run everything immediately on startup
@@ -490,7 +515,7 @@ if __name__ == "__main__":
 
     scheduler = BlockingScheduler(timezone="Asia/Kolkata")
 
-    # Hackathons + Internships + Scholarships — every 6 hours
+    # Hackathons + Internships + Scholarships + Jobs — every 6 hours
     scheduler.add_job(
         run_all_scrapers,
         IntervalTrigger(hours=6),
