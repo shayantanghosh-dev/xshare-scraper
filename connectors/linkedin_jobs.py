@@ -18,6 +18,7 @@ Env vars required:
 """
 
 import os
+import re
 import sys
 import time
 import logging
@@ -55,19 +56,163 @@ def _headers(token: str) -> dict:
         "Content-Type":  "application/json",
     }
 
+def _clean(v) -> str:
+    """Stringify and strip; return '' for None/empty."""
+    return str(v).strip() if v else ""
+
+def _clean_text(v) -> str:
+    """
+    Strip HTML tags and collapse all whitespace (including \\n \\t) to
+    single spaces. Used for description → tagline so the tagline never
+    contains raw newlines or HTML markup.
+    """
+    if not v:
+        return ""
+    s = str(v)
+    s = re.sub(r"<[^>]+>", " ", s)      # strip HTML
+    s = re.sub(r"\s+", " ", s).strip()  # collapse whitespace / newlines
+    return s
+
+def _task_slug(task_id: str) -> str:
+    """'shayantan_ghosh-dev~linkedin-jobs-data-analyst-india-daily'
+       → 'linkedin-jobs-data-analyst-india-daily'
+    """
+    return task_id.split("~", 1)[-1] if "~" in task_id else task_id
+
 def _normalize_remote(location: str, work_type: str) -> bool:
     combined = f"{location} {work_type}".lower()
     return any(k in combined for k in ("remote", "hybrid", "virtual", "work from home"))
 
-def _clean(v) -> str:
-    return str(v).strip() if v else ""
 
-def _task_slug(task_id: str) -> str:
-    """Extract a short stable key from the task ID for scoping DB queries.
-    e.g. 'shayantan_ghosh-dev~linkedin-jobs-data-analyst-india-daily'
-         → 'linkedin-jobs-data-analyst-india-daily'
+# ── field extractors ─────────────────────────────────────────────────────────
+
+def _extract_url(item: dict) -> str:
+    """LinkedIn actors variously use jobUrl / link / url / applyUrl."""
+    for key in ("jobUrl", "link", "url", "applyUrl", "jobLink"):
+        val = _clean(item.get(key, ""))
+        if val:
+            return val
+    return ""
+
+
+def _extract_description(item: dict) -> str:
     """
-    return task_id.split("~", 1)[-1] if "~" in task_id else task_id
+    Description can be a plain string or a dict {text: '...', html: '...'}.
+    Returns cleaned plain text (no HTML, no raw newlines).
+    """
+    for key in ("descriptionText", "jobDescription", "description",
+                "summary", "content", "jobContent"):
+        val = item.get(key)
+        if not val:
+            continue
+        if isinstance(val, dict):
+            text = val.get("text") or val.get("html") or ""
+            if text:
+                return _clean_text(text)
+        else:
+            cleaned = _clean_text(val)
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def _extract_experience(item: dict) -> str:
+    """
+    LinkedIn actors vary between experienceLevel / seniorityLevel /
+    seniority / jobLevel. Try all common variants.
+    """
+    for key in ("experienceLevel", "seniorityLevel", "seniority",
+                "jobLevel", "level", "jobSeniority", "careerLevel"):
+        val = _clean(item.get(key, ""))
+        if val and val.lower() not in ("none", "null", "not applicable", ""):
+            return val
+    return ""
+
+
+def _extract_salary(item: dict) -> str:
+    """
+    Salary can be:
+      - a plain string   "₹10L – ₹20L/yr"
+      - a dict           {min/from, max/to, currency, period}
+    """
+    for key in ("salary", "salaryRange", "compensation", "salaryInfo",
+                "salaryText", "pay"):
+        val = item.get(key)
+        if not val:
+            continue
+        if isinstance(val, str):
+            cleaned = val.strip()
+            if cleaned and cleaned.lower() not in ("null", "none", "0", ""):
+                return cleaned
+        if isinstance(val, dict):
+            lo  = val.get("min")  or val.get("from") or val.get("minimum")
+            hi  = val.get("max")  or val.get("to")   or val.get("maximum")
+            cur = val.get("currency", "₹")
+            per = (val.get("period") or val.get("type") or "").lower()
+            suffix = {
+                "monthly": "/mo", "yearly": "/yr",
+                "annual":  "/yr", "hourly": "/hr",
+            }.get(per, "")
+            if lo and hi:
+                return f"{cur}{int(lo):,} – {cur}{int(hi):,}{suffix}"
+            if hi:
+                return f"Up to {cur}{int(hi):,}{suffix}"
+            if lo:
+                return f"From {cur}{int(lo):,}{suffix}"
+    return "Not disclosed"
+
+
+def _extract_skills(item: dict) -> list[str]:
+    """Skills can be list[str] or list[{name: '...'}]."""
+    for key in ("skills", "requiredSkills", "preferredSkills",
+                "jobSkills", "skillList"):
+        raw = item.get(key)
+        if not raw:
+            continue
+        if isinstance(raw, list) and raw:
+            result = []
+            for s in raw:
+                if isinstance(s, dict):
+                    name = _clean(s.get("name") or s.get("skill") or "")
+                elif isinstance(s, str):
+                    name = s.strip()
+                else:
+                    name = ""
+                if name:
+                    result.append(name)
+            if result:
+                return result
+        if isinstance(raw, str) and raw.strip():
+            return [s.strip() for s in raw.split(",") if s.strip()]
+    return []
+
+
+def _extract_posted_at(item: dict) -> str:
+    """Date the job was posted; try every field name LinkedIn actors use."""
+    for key in ("postedAt", "listedAt", "publishedAt", "datePosted",
+                "postedDate", "createdAt", "date", "postDate"):
+        val = _clean(item.get(key, ""))
+        if val and val.lower() not in ("null", "none"):
+            return val
+    return ""
+
+
+def _extract_applicants(item: dict) -> str:
+    """Number of applicants; returns a formatted string or ''."""
+    for key in ("applicantCount", "numberOfApplicants", "applies",
+                "totalApplicants", "applicants", "applyCount"):
+        val = item.get(key)
+        if val is None:
+            continue
+        try:
+            n = int(val)
+            if n > 0:
+                return f"{n:,}"
+        except (ValueError, TypeError):
+            s = _clean(str(val))
+            if s and s.lower() not in ("null", "none", "0"):
+                return s
+    return ""
 
 
 # ── Apify API calls ───────────────────────────────────────────────────────────
@@ -141,37 +286,26 @@ def fetch_jobs(task_id: str = DEFAULT_TASK_ID) -> list[dict]:
 # ── normalise ─────────────────────────────────────────────────────────────────
 
 def _normalise(item: dict, slug: str) -> dict | None:
-    url = _clean(item.get("jobUrl") or item.get("url") or item.get("applyUrl", ""))
+    url = _extract_url(item)
     if not url:
         return None
 
-    title   = _clean(item.get("title") or item.get("jobTitle", ""))
-    company = _clean(item.get("companyName") or item.get("company", ""))
+    title = _clean(item.get("title") or item.get("jobTitle", ""))
     if not title:
         return None
 
-    location      = _clean(item.get("location", ""))
-    work_type     = _clean(item.get("workType") or item.get("workplaceType", ""))
-    contract_type = _clean(item.get("contractType") or item.get("employmentType", ""))
-    experience    = _clean(item.get("experienceLevel", ""))
-    salary        = _clean(item.get("salary") or item.get("salaryRange", ""))
-    description   = _clean(item.get("descriptionText") or item.get("description", ""))
-    tagline       = description[:300].rsplit(" ", 1)[0] + "…" if len(description) > 300 else description
+    company   = _clean(item.get("companyName") or item.get("company", ""))
+    location  = _clean(item.get("location", ""))
+    work_type = _clean(item.get("workType") or item.get("workplaceType", ""))
 
-    skills_raw = item.get("skills") or []
-    if isinstance(skills_raw, list):
-        skills = [_clean(s) for s in skills_raw if s]
-    else:
-        skills = [s.strip() for s in str(skills_raw).split(",") if s.strip()]
-
-    posted_at = _clean(
-        item.get("postedAt") or item.get("postedDate") or item.get("publishedAt", "")
+    description = _extract_description(item)
+    tagline     = (
+        description[:300].rsplit(" ", 1)[0] + "…"
+        if len(description) > 300
+        else description
     )
 
-    # Roles this job matched across LinkedIn searches. The scheduler attaches
-    # `_matched_roles` after merging the 4 role-task results by URL. If a
-    # caller invokes the connector directly (without merging), fall back to
-    # the task_slug so the field is always populated.
+    contract_type = _clean(item.get("contractType") or item.get("employmentType", ""))
     matched_roles = item.get("_matched_roles") or [slug]
 
     return {
@@ -184,11 +318,12 @@ def _normalise(item: dict, slug: str) -> dict | None:
         "url":              url,
         "tagline":          tagline,
         "job_type":         contract_type or "Full-time",
-        "experience_level": experience,
+        "experience_level": _extract_experience(item),
         "is_remote":        _normalize_remote(location, work_type),
-        "salary":           salary or "Not disclosed",
-        "skills":           skills,
-        "date_posted":      posted_at,
+        "salary":           _extract_salary(item),
+        "skills":           _extract_skills(item),
+        "applicants":       _extract_applicants(item),
+        "date_posted":      _extract_posted_at(item),
         "scraped_at":       datetime.now(timezone.utc).isoformat(),
     }
 
@@ -210,8 +345,6 @@ def save_to_supabase(
 
     current_urls = {r["url"] for r in records}
 
-    # Scope the existing-URL query to THIS task's slug only — never touch
-    # records belonging to other LinkedIn tasks.
     try:
         res = (
             supabase.table(TABLE)
@@ -228,7 +361,6 @@ def save_to_supabase(
     new_count     = len(current_urls - existing_urls)
     updated_count = len(current_urls & existing_urls)
 
-    # Delete stale URLs scoped to this task only
     to_delete = list(existing_urls - current_urls)
     deleted   = 0
     if to_delete:
