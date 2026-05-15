@@ -3,8 +3,8 @@ LinkedIn Jobs — Apify connector
 Triggers the saved Apify task, polls until done, pulls dataset,
 normalises, and upserts into the `jobs` Supabase table.
 
-Supports multiple role-specific Apify tasks via the `task_id` argument
-passed to fetch_jobs().
+Each role-specific task is scoped by `task_slug` so tasks never
+delete each other's records during the stale-URL cleanup step.
 
 Env vars required:
   APIFY_TOKEN
@@ -29,7 +29,6 @@ SOURCE     = "linkedin"
 TABLE      = "jobs"
 BATCH_SIZE = 500
 
-# Default (general) task — kept as fallback
 DEFAULT_TASK_ID = "shayantan_ghosh-dev~linkedin-jobs-software-engineer-india-daily"
 
 APIFY_BASE    = "https://api.apify.com/v2"
@@ -57,6 +56,13 @@ def _normalize_remote(location: str, work_type: str) -> bool:
 
 def _clean(v) -> str:
     return str(v).strip() if v else ""
+
+def _task_slug(task_id: str) -> str:
+    """Extract a short stable key from the task ID for scoping DB queries.
+    e.g. 'shayantan_ghosh-dev~linkedin-jobs-data-analyst-india-daily'
+         → 'linkedin-jobs-data-analyst-india-daily'
+    """
+    return task_id.split("~", 1)[-1] if "~" in task_id else task_id
 
 
 # ── Apify API calls ───────────────────────────────────────────────────────────
@@ -129,7 +135,7 @@ def fetch_jobs(task_id: str = DEFAULT_TASK_ID) -> list[dict]:
 
 # ── normalise ─────────────────────────────────────────────────────────────────
 
-def _normalise(item: dict) -> dict | None:
+def _normalise(item: dict, slug: str) -> dict | None:
     url = _clean(item.get("jobUrl") or item.get("url") or item.get("applyUrl", ""))
     if not url:
         return None
@@ -159,6 +165,7 @@ def _normalise(item: dict) -> dict | None:
 
     return {
         "source":           SOURCE,
+        "task_slug":        slug,          # scopes stale-URL cleanup per task
         "title":            title,
         "company":          company,
         "location":         location or "India",
@@ -176,19 +183,31 @@ def _normalise(item: dict) -> dict | None:
 
 # ── save ──────────────────────────────────────────────────────────────────────
 
-def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
+def save_to_supabase(
+    raw_items: list[dict],
+    task_id: str = DEFAULT_TASK_ID,
+) -> tuple[int, int, int]:
     if not raw_items:
         return 0, 0, 0
 
-    records = [r for r in (_normalise(i) for i in raw_items) if r]
+    slug    = _task_slug(task_id)
+    records = [r for r in (_normalise(i, slug) for i in raw_items) if r]
     if not records:
         log.warning("  No valid records after normalisation.")
         return 0, 0, 0
 
     current_urls = {r["url"] for r in records}
 
+    # Scope the existing-URL query to THIS task's slug only — never touch
+    # records belonging to other LinkedIn tasks.
     try:
-        res           = supabase.table(TABLE).select("url").eq("source", SOURCE).execute()
+        res = (
+            supabase.table(TABLE)
+            .select("url")
+            .eq("source", SOURCE)
+            .eq("task_slug", slug)
+            .execute()
+        )
         existing_urls = {r["url"] for r in (res.data or [])}
     except Exception as e:
         log.warning(f"  Could not read existing rows: {e}")
@@ -197,6 +216,7 @@ def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
     new_count     = len(current_urls - existing_urls)
     updated_count = len(current_urls & existing_urls)
 
+    # Delete stale URLs scoped to this task only
     to_delete = list(existing_urls - current_urls)
     deleted   = 0
     if to_delete:
@@ -204,11 +224,14 @@ def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
             chunk = to_delete[i : i + 200]
             try:
                 supabase.table(TABLE).delete() \
-                    .eq("source", SOURCE).in_("url", chunk).execute()
+                    .eq("source", SOURCE) \
+                    .eq("task_slug", slug) \
+                    .in_("url", chunk) \
+                    .execute()
                 deleted += len(chunk)
             except Exception as e:
                 log.warning(f"  Delete chunk failed: {e}")
-        print(f"  🗑  Removed {deleted} stale LinkedIn jobs")
+        print(f"  🗑  Removed {deleted} stale LinkedIn jobs [{slug}]")
 
     for i in range(0, len(records), BATCH_SIZE):
         chunk = records[i : i + BATCH_SIZE]
