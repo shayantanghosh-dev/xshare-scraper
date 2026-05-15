@@ -359,7 +359,8 @@ def _run_linkedin_task(label: str, task_id: str) -> tuple[int, int, int]:
     if not raw:
         _warn("No data returned from Apify")
         return 0, 0, 0
-    new, updated, deleted = linkedin_save(raw)
+    # Pass task_id so save_to_supabase scopes the cleanup to this task only
+    new, updated, deleted = linkedin_save(raw, task_id=task_id)
     _ok(f"{new} new  ·  {updated} updated  ·  {deleted} removed")
     return new, updated, deleted
 
@@ -367,28 +368,16 @@ def _run_linkedin_task(label: str, task_id: str) -> tuple[int, int, int]:
 # ── LinkedIn: one runner per role ──────────────────────────────────────────────
 
 def _run_linkedin_software_engineer() -> tuple[int, int, int]:
-    return _run_linkedin_task(
-        "Software Engineer",
-        LINKEDIN_TASKS["Software Engineer"],
-    )
+    return _run_linkedin_task("Software Engineer", LINKEDIN_TASKS["Software Engineer"])
 
 def _run_linkedin_fullstack() -> tuple[int, int, int]:
-    return _run_linkedin_task(
-        "Full Stack Developer",
-        LINKEDIN_TASKS["Full Stack Developer"],
-    )
+    return _run_linkedin_task("Full Stack Developer", LINKEDIN_TASKS["Full Stack Developer"])
 
 def _run_linkedin_data_analyst() -> tuple[int, int, int]:
-    return _run_linkedin_task(
-        "Data Analyst",
-        LINKEDIN_TASKS["Data Analyst"],
-    )
+    return _run_linkedin_task("Data Analyst", LINKEDIN_TASKS["Data Analyst"])
 
 def _run_linkedin_frontend() -> tuple[int, int, int]:
-    return _run_linkedin_task(
-        "Frontend Developer",
-        LINKEDIN_TASKS["Frontend Developer"],
-    )
+    return _run_linkedin_task("Frontend Developer", LINKEDIN_TASKS["Frontend Developer"])
 
 
 # ── Indeed ─────────────────────────────────────────────────────────────────────
