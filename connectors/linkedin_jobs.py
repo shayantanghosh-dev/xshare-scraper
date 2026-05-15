@@ -1,12 +1,10 @@
 """
 LinkedIn Jobs — Apify connector
-=================================
-Calls the saved Apify task  shayantan_ghosh-dev/linkedin-jobs-india-daily,
-polls until the run finishes, pulls all items from the default dataset,
-normalises them, and upserts into the `jobs` Supabase table.
+Triggers the saved Apify task, polls until done, pulls dataset,
+normalises, and upserts into the `jobs` Supabase table.
 
 Env vars required:
-  APIFY_TOKEN   — your Apify API token (Settings → Integrations)
+  APIFY_TOKEN
   SUPABASE_URL
   SUPABASE_KEY
 """
@@ -28,54 +26,50 @@ SOURCE     = "linkedin"
 TABLE      = "jobs"
 BATCH_SIZE = 500
 
-# ── Apify task identifier (from your saved task URL) ───────────────────────────
-TASK_ID    = "shayantan_ghosh-dev~linkedin-jobs-india-daily"   # ~ replaces /
+TASK_ID    = "shayantan_ghosh-dev~linkedin-jobs-india-daily"
 APIFY_BASE = "https://api.apify.com/v2"
 
-# How long to wait for the actor run to complete (seconds)
-POLL_INTERVAL = 10
-MAX_WAIT_S    = 600   # 10 minutes
+POLL_INTERVAL = 15
+MAX_WAIT_S    = 600
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _token() -> str:
     t = os.environ.get("APIFY_TOKEN", "")
     if not t:
-        raise EnvironmentError("APIFY_TOKEN environment variable is not set.")
+        raise EnvironmentError("APIFY_TOKEN is not set.")
     return t
 
+def _headers(token: str) -> dict:
+    """Use Authorization header instead of ?token= query param."""
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    }
 
 def _normalize_remote(location: str, work_type: str) -> bool:
-    """Return True if the job is remote."""
     combined = f"{location} {work_type}".lower()
     return any(k in combined for k in ("remote", "hybrid", "virtual", "work from home"))
 
-
 def _clean(v) -> str:
-    """Return stripped string or empty string."""
     return str(v).strip() if v else ""
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# APIFY — run task + fetch dataset
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Apify API calls ───────────────────────────────────────────────────────────
 
 def _start_run(token: str) -> dict:
-    """Start the Apify task and return the run object."""
-    url = f"{APIFY_BASE}/actor-tasks/{TASK_ID}/runs"
-    resp = requests.post(url, params={"token": token}, timeout=30)
+    url  = f"{APIFY_BASE}/actor-tasks/{TASK_ID}/runs"
+    resp = requests.post(url, headers=_headers(token), timeout=30)
+    if not resp.ok:
+        log.error(f"  Apify trigger failed: {resp.status_code} — {resp.text[:300]}")
     resp.raise_for_status()
-    data = resp.json()
-    run  = data.get("data", {})
+    run = resp.json().get("data", {})
     log.info(f"  Run started  id={run.get('id')}  status={run.get('status')}")
     return run
 
 
 def _poll_run(run_id: str, token: str) -> dict:
-    """Poll until the run reaches a terminal state. Returns final run data."""
     url     = f"{APIFY_BASE}/actor-runs/{run_id}"
     elapsed = 0
 
@@ -83,12 +77,12 @@ def _poll_run(run_id: str, token: str) -> dict:
         time.sleep(POLL_INTERVAL)
         elapsed += POLL_INTERVAL
 
-        resp   = requests.get(url, params={"token": token}, timeout=30)
+        resp   = requests.get(url, headers=_headers(token), timeout=30)
         resp.raise_for_status()
         run    = resp.json().get("data", {})
         status = run.get("status", "")
 
-        log.info(f"  [{elapsed:>4}s] Run {run_id} → {status}")
+        print(f"  [{elapsed:>4}s] Run status: {status}")
 
         if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
             return run
@@ -97,43 +91,32 @@ def _poll_run(run_id: str, token: str) -> dict:
 
 
 def _fetch_dataset(dataset_id: str, token: str) -> list[dict]:
-    """Download all items from a dataset."""
     url  = f"{APIFY_BASE}/datasets/{dataset_id}/items"
     resp = requests.get(
         url,
-        params={"token": token, "format": "json", "clean": "true"},
+        headers=_headers(token),
+        params={"format": "json", "clean": "true"},
         timeout=120,
     )
     resp.raise_for_status()
     items = resp.json()
-    log.info(f"  Dataset {dataset_id} → {len(items)} items")
+    print(f"  Dataset {dataset_id} → {len(items)} items")
     return items if isinstance(items, list) else []
 
 
 def fetch_jobs() -> list[dict]:
-    """
-    Trigger the Apify task, wait for it to finish, and return raw item list.
-    """
     token = _token()
 
-    log.info("=" * 52)
-    log.info("LinkedIn Jobs — Apify")
-    log.info("=" * 52)
-
-    # 1. Start
-    run = _start_run(token)
+    print("  Starting LinkedIn Apify run...")
+    run    = _start_run(token)
     run_id = run.get("id")
     if not run_id:
         raise RuntimeError("No run ID returned from Apify.")
 
-    # 2. Poll
     final_run = _poll_run(run_id, token)
     if final_run.get("status") != "SUCCEEDED":
-        raise RuntimeError(
-            f"Apify run ended with status: {final_run.get('status')}"
-        )
+        raise RuntimeError(f"Apify run ended with status: {final_run.get('status')}")
 
-    # 3. Fetch dataset
     dataset_id = final_run.get("defaultDatasetId")
     if not dataset_id:
         raise RuntimeError("No defaultDatasetId in completed run.")
@@ -141,13 +124,9 @@ def fetch_jobs() -> list[dict]:
     return _fetch_dataset(dataset_id, token)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# NORMALISE
-# ──────────────────────────────────────────────────────────────────────────────
+# ── normalise ─────────────────────────────────────────────────────────────────
 
 def _normalise(item: dict) -> dict | None:
-    """Map a raw LinkedIn Apify item to the jobs table schema."""
-    # LinkedIn scraper field names (Apify's official LinkedIn Jobs Scraper actor)
     url = _clean(item.get("jobUrl") or item.get("url") or item.get("applyUrl", ""))
     if not url:
         return None
@@ -163,10 +142,8 @@ def _normalise(item: dict) -> dict | None:
     experience    = _clean(item.get("experienceLevel", ""))
     salary        = _clean(item.get("salary") or item.get("salaryRange", ""))
     description   = _clean(item.get("descriptionText") or item.get("description", ""))
-    # Truncate description for tagline (first 300 chars)
-    tagline = description[:300].rsplit(" ", 1)[0] + "…" if len(description) > 300 else description
+    tagline       = description[:300].rsplit(" ", 1)[0] + "…" if len(description) > 300 else description
 
-    # Skills — some variants return a list, others a comma string
     skills_raw = item.get("skills") or []
     if isinstance(skills_raw, list):
         skills = [_clean(s) for s in skills_raw if s]
@@ -194,32 +171,19 @@ def _normalise(item: dict) -> dict | None:
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SAVE
-# ──────────────────────────────────────────────────────────────────────────────
+# ── save ──────────────────────────────────────────────────────────────────────
 
 def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
-    """
-    Upsert jobs into Supabase `jobs` table.
-    Returns (new, updated, deleted).
-    """
     if not raw_items:
         return 0, 0, 0
 
-    # Build records
-    records = []
-    for item in raw_items:
-        rec = _normalise(item)
-        if rec:
-            records.append(rec)
-
+    records = [r for r in (_normalise(i) for i in raw_items) if r]
     if not records:
         log.warning("  No valid records after normalisation.")
         return 0, 0, 0
 
     current_urls = {r["url"] for r in records}
 
-    # Snapshot existing
     try:
         res           = supabase.table(TABLE).select("url").eq("source", SOURCE).execute()
         existing_urls = {r["url"] for r in (res.data or [])}
@@ -230,7 +194,7 @@ def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
     new_count     = len(current_urls - existing_urls)
     updated_count = len(current_urls & existing_urls)
 
-    # Remove stale jobs (no longer returned by the actor)
+    # Remove stale jobs no longer in the latest run
     to_delete = list(existing_urls - current_urls)
     deleted   = 0
     if to_delete:
@@ -242,9 +206,8 @@ def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
                 deleted += len(chunk)
             except Exception as e:
                 log.warning(f"  Delete chunk failed: {e}")
-        log.info(f"  🗑  Removed {deleted} stale LinkedIn jobs")
+        print(f"  🗑  Removed {deleted} stale LinkedIn jobs")
 
-    # Upsert
     for i in range(0, len(records), BATCH_SIZE):
         chunk = records[i : i + BATCH_SIZE]
         try:
@@ -252,13 +215,10 @@ def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
         except Exception as e:
             log.warning(f"  Upsert batch {i // BATCH_SIZE + 1} failed: {e}")
 
-    log.info(f"  ✓  {new_count} new  ·  {updated_count} updated  ·  {deleted} removed")
     return new_count, updated_count, deleted
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ──────────────────────────────────────────────────────────────────────────────
+# ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
