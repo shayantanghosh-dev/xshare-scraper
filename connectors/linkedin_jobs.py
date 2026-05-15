@@ -3,6 +3,9 @@ LinkedIn Jobs — Apify connector
 Triggers the saved Apify task, polls until done, pulls dataset,
 normalises, and upserts into the `jobs` Supabase table.
 
+Supports multiple role-specific Apify tasks via the `task_id` argument
+passed to fetch_jobs().
+
 Env vars required:
   APIFY_TOKEN
   SUPABASE_URL
@@ -26,9 +29,10 @@ SOURCE     = "linkedin"
 TABLE      = "jobs"
 BATCH_SIZE = 500
 
-TASK_ID    = "shayantan_ghosh-dev~linkedin-jobs-india-daily"
-APIFY_BASE = "https://api.apify.com/v2"
+# Default (general) task — kept as fallback
+DEFAULT_TASK_ID = "shayantan_ghosh-dev~linkedin-jobs-software-engineer-india-daily"
 
+APIFY_BASE    = "https://api.apify.com/v2"
 POLL_INTERVAL = 15
 MAX_WAIT_S    = 600
 
@@ -42,7 +46,6 @@ def _token() -> str:
     return t
 
 def _headers(token: str) -> dict:
-    """Use Authorization header instead of ?token= query param."""
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type":  "application/json",
@@ -58,8 +61,8 @@ def _clean(v) -> str:
 
 # ── Apify API calls ───────────────────────────────────────────────────────────
 
-def _start_run(token: str) -> dict:
-    url  = f"{APIFY_BASE}/actor-tasks/{TASK_ID}/runs"
+def _start_run(token: str, task_id: str) -> dict:
+    url  = f"{APIFY_BASE}/actor-tasks/{task_id}/runs"
     resp = requests.post(url, headers=_headers(token), timeout=30)
     if not resp.ok:
         log.error(f"  Apify trigger failed: {resp.status_code} — {resp.text[:300]}")
@@ -104,11 +107,11 @@ def _fetch_dataset(dataset_id: str, token: str) -> list[dict]:
     return items if isinstance(items, list) else []
 
 
-def fetch_jobs() -> list[dict]:
+def fetch_jobs(task_id: str = DEFAULT_TASK_ID) -> list[dict]:
     token = _token()
 
-    print("  Starting LinkedIn Apify run...")
-    run    = _start_run(token)
+    print(f"  Starting LinkedIn Apify run  [{task_id}]...")
+    run    = _start_run(token, task_id)
     run_id = run.get("id")
     if not run_id:
         raise RuntimeError("No run ID returned from Apify.")
@@ -194,7 +197,6 @@ def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
     new_count     = len(current_urls - existing_urls)
     updated_count = len(current_urls & existing_urls)
 
-    # Remove stale jobs no longer in the latest run
     to_delete = list(existing_urls - current_urls)
     deleted   = 0
     if to_delete:
