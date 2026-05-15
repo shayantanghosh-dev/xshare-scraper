@@ -1,12 +1,10 @@
 """
 Indeed Jobs — Apify connector
-================================
-Calls the saved Apify task  shayantan_ghosh-dev/indeed-jobs-india-daily,
-polls until the run finishes, pulls all items from the default dataset,
-normalises them, and upserts into the `jobs` Supabase table.
+Triggers the saved Apify task, polls until done, pulls dataset,
+normalises, and upserts into the `jobs` Supabase table.
 
 Env vars required:
-  APIFY_TOKEN   — your Apify API token (Settings → Integrations)
+  APIFY_TOKEN
   SUPABASE_URL
   SUPABASE_KEY
 """
@@ -28,43 +26,45 @@ SOURCE     = "indeed"
 TABLE      = "jobs"
 BATCH_SIZE = 500
 
-# ── Apify task identifier (from your saved task URL) ───────────────────────────
-TASK_ID    = "shayantan_ghosh-dev~indeed-jobs-india-daily"   # ~ replaces /
+TASK_ID    = "shayantan_ghosh-dev~indeed-jobs-india-daily"
 APIFY_BASE = "https://api.apify.com/v2"
 
-POLL_INTERVAL = 10
-MAX_WAIT_S    = 600   # 10 minutes
+POLL_INTERVAL = 15
+MAX_WAIT_S    = 600
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _token() -> str:
     t = os.environ.get("APIFY_TOKEN", "")
     if not t:
-        raise EnvironmentError("APIFY_TOKEN environment variable is not set.")
+        raise EnvironmentError("APIFY_TOKEN is not set.")
     return t
 
+def _headers(token: str) -> dict:
+    """Use Authorization header instead of ?token= query param."""
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    }
 
 def _clean(v) -> str:
     return str(v).strip() if v else ""
-
 
 def _is_remote(location: str, job_type: str) -> bool:
     combined = f"{location} {job_type}".lower()
     return any(k in combined for k in ("remote", "hybrid", "work from home", "virtual"))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# APIFY — run task + fetch dataset
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Apify API calls ───────────────────────────────────────────────────────────
 
 def _start_run(token: str) -> dict:
     url  = f"{APIFY_BASE}/actor-tasks/{TASK_ID}/runs"
-    resp = requests.post(url, params={"token": token}, timeout=30)
+    resp = requests.post(url, headers=_headers(token), timeout=30)
+    if not resp.ok:
+        log.error(f"  Apify trigger failed: {resp.status_code} — {resp.text[:300]}")
     resp.raise_for_status()
-    run  = resp.json().get("data", {})
+    run = resp.json().get("data", {})
     log.info(f"  Run started  id={run.get('id')}  status={run.get('status')}")
     return run
 
@@ -77,12 +77,12 @@ def _poll_run(run_id: str, token: str) -> dict:
         time.sleep(POLL_INTERVAL)
         elapsed += POLL_INTERVAL
 
-        resp   = requests.get(url, params={"token": token}, timeout=30)
+        resp   = requests.get(url, headers=_headers(token), timeout=30)
         resp.raise_for_status()
         run    = resp.json().get("data", {})
         status = run.get("status", "")
 
-        log.info(f"  [{elapsed:>4}s] Run {run_id} → {status}")
+        print(f"  [{elapsed:>4}s] Run status: {status}")
 
         if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
             return run
@@ -94,35 +94,28 @@ def _fetch_dataset(dataset_id: str, token: str) -> list[dict]:
     url  = f"{APIFY_BASE}/datasets/{dataset_id}/items"
     resp = requests.get(
         url,
-        params={"token": token, "format": "json", "clean": "true"},
+        headers=_headers(token),
+        params={"format": "json", "clean": "true"},
         timeout=120,
     )
     resp.raise_for_status()
     items = resp.json()
-    log.info(f"  Dataset {dataset_id} → {len(items)} items")
+    print(f"  Dataset {dataset_id} → {len(items)} items")
     return items if isinstance(items, list) else []
 
 
 def fetch_jobs() -> list[dict]:
-    """
-    Trigger the Apify task, wait for it to finish, and return raw item list.
-    """
     token = _token()
 
-    log.info("=" * 52)
-    log.info("Indeed Jobs — Apify")
-    log.info("=" * 52)
-
-    run = _start_run(token)
+    print("  Starting Indeed Apify run...")
+    run    = _start_run(token)
     run_id = run.get("id")
     if not run_id:
         raise RuntimeError("No run ID returned from Apify.")
 
     final_run = _poll_run(run_id, token)
     if final_run.get("status") != "SUCCEEDED":
-        raise RuntimeError(
-            f"Apify run ended with status: {final_run.get('status')}"
-        )
+        raise RuntimeError(f"Apify run ended with status: {final_run.get('status')}")
 
     dataset_id = final_run.get("defaultDatasetId")
     if not dataset_id:
@@ -131,17 +124,11 @@ def fetch_jobs() -> list[dict]:
     return _fetch_dataset(dataset_id, token)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# NORMALISE
-# ──────────────────────────────────────────────────────────────────────────────
+# ── normalise ─────────────────────────────────────────────────────────────────
 
 def _normalise(item: dict) -> dict | None:
-    """Map a raw Indeed Apify item to the jobs table schema."""
-    # Indeed scraper field names (Apify's official Indeed Jobs Scraper actor)
     url = _clean(
-        item.get("url")
-        or item.get("jobUrl")
-        or item.get("externalApplyLink", "")
+        item.get("url") or item.get("jobUrl") or item.get("externalApplyLink", "")
     )
     if not url:
         return None
@@ -158,12 +145,9 @@ def _normalise(item: dict) -> dict | None:
     tagline     = description[:300].rsplit(" ", 1)[0] + "…" if len(description) > 300 else description
 
     posted_at = _clean(
-        item.get("datePostedFormatted")
-        or item.get("postedAt")
-        or item.get("publishedAt", "")
+        item.get("datePostedFormatted") or item.get("postedAt") or item.get("publishedAt", "")
     )
 
-    # Indeed sometimes returns skills as a list, sometimes not at all
     skills_raw = item.get("skills") or []
     if isinstance(skills_raw, list):
         skills = [_clean(s) for s in skills_raw if s]
@@ -187,24 +171,13 @@ def _normalise(item: dict) -> dict | None:
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SAVE
-# ──────────────────────────────────────────────────────────────────────────────
+# ── save ──────────────────────────────────────────────────────────────────────
 
 def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
-    """
-    Upsert jobs into Supabase `jobs` table.
-    Returns (new, updated, deleted).
-    """
     if not raw_items:
         return 0, 0, 0
 
-    records = []
-    for item in raw_items:
-        rec = _normalise(item)
-        if rec:
-            records.append(rec)
-
+    records = [r for r in (_normalise(i) for i in raw_items) if r]
     if not records:
         log.warning("  No valid records after normalisation.")
         return 0, 0, 0
@@ -232,7 +205,7 @@ def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
                 deleted += len(chunk)
             except Exception as e:
                 log.warning(f"  Delete chunk failed: {e}")
-        log.info(f"  🗑  Removed {deleted} stale Indeed jobs")
+        print(f"  🗑  Removed {deleted} stale Indeed jobs")
 
     for i in range(0, len(records), BATCH_SIZE):
         chunk = records[i : i + BATCH_SIZE]
@@ -241,13 +214,10 @@ def save_to_supabase(raw_items: list[dict]) -> tuple[int, int, int]:
         except Exception as e:
             log.warning(f"  Upsert batch {i // BATCH_SIZE + 1} failed: {e}")
 
-    log.info(f"  ✓  {new_count} new  ·  {updated_count} updated  ·  {deleted} removed")
     return new_count, updated_count, deleted
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ──────────────────────────────────────────────────────────────────────────────
+# ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
