@@ -1,5 +1,5 @@
 """
-xShare Master Scheduler  (v5)
+xShare Master Scheduler  (v6)
 ==============================
 Single entry point — runs all scrapers on a fixed schedule.
 
@@ -7,7 +7,7 @@ Single entry point — runs all scrapers on a fixed schedule.
     Hackathons   → Unstop, Devfolio, Devpost, HackerEarth
     Internships  → Unstop
     Scholarships → Buddy4Study
-    Jobs         → LinkedIn, Indeed  (via Apify — requires APIFY_TOKEN)
+    Jobs         → LinkedIn (4 role tasks), Indeed  (via Apify — requires APIFY_TOKEN)
 
 Environment variables required:
   SUPABASE_URL
@@ -26,8 +26,6 @@ from datetime import datetime, timezone
 sys.stdout.reconfigure(line_buffering=True)
 
 # ── Silence noisy third-party loggers ─────────────────────────────────────────
-#    httpx / httpcore print every Supabase HTTP call at INFO level.
-#    APScheduler prints scheduler internals. We only want WARNING+ from them.
 for _noisy in (
     "httpx", "httpcore",
     "apscheduler.scheduler", "apscheduler.executors.default",
@@ -72,6 +70,14 @@ BATCH_SIZE = 500
 W          = 60
 _run_count = 0
 
+# ── LinkedIn Apify task IDs ────────────────────────────────────────────────────
+LINKEDIN_TASKS = {
+    "Software Engineer":    "shayantan_ghosh-dev~linkedin-jobs-software-engineer-india-daily",
+    "Full Stack Developer": "shayantan_ghosh-dev~linkedin-jobs-full-stack-developer-india-daily",
+    "Data Analyst":         "shayantan_ghosh-dev~linkedin-jobs-data-analyst-india-daily",
+    "Frontend Developer":   "shayantan_ghosh-dev~linkedin-jobs-frontend-developer-india-daily",
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OUTPUT HELPERS
@@ -109,7 +115,6 @@ def _elapsed(t0: datetime) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _check_env() -> dict[str, bool]:
-    """Warn clearly about any missing env vars."""
     checks = {
         "SUPABASE_URL": bool(os.environ.get("SUPABASE_URL")),
         "SUPABASE_KEY": bool(os.environ.get("SUPABASE_KEY")),
@@ -343,11 +348,14 @@ def _run_buddy4study() -> tuple[int, int, int]:
     return _save_scholarships(df)
 
 
-def _run_linkedin_jobs() -> tuple[int, int, int]:
+# ── LinkedIn: generic helper ───────────────────────────────────────────────────
+
+def _run_linkedin_task(label: str, task_id: str) -> tuple[int, int, int]:
     if not os.environ.get("APIFY_TOKEN"):
         _warn("Skipped — APIFY_TOKEN not set")
         return 0, 0, 0
-    raw = linkedin_fetch()
+    print(f"  Task: {label}")
+    raw = linkedin_fetch(task_id=task_id)
     if not raw:
         _warn("No data returned from Apify")
         return 0, 0, 0
@@ -355,6 +363,35 @@ def _run_linkedin_jobs() -> tuple[int, int, int]:
     _ok(f"{new} new  ·  {updated} updated  ·  {deleted} removed")
     return new, updated, deleted
 
+
+# ── LinkedIn: one runner per role ──────────────────────────────────────────────
+
+def _run_linkedin_software_engineer() -> tuple[int, int, int]:
+    return _run_linkedin_task(
+        "Software Engineer",
+        LINKEDIN_TASKS["Software Engineer"],
+    )
+
+def _run_linkedin_fullstack() -> tuple[int, int, int]:
+    return _run_linkedin_task(
+        "Full Stack Developer",
+        LINKEDIN_TASKS["Full Stack Developer"],
+    )
+
+def _run_linkedin_data_analyst() -> tuple[int, int, int]:
+    return _run_linkedin_task(
+        "Data Analyst",
+        LINKEDIN_TASKS["Data Analyst"],
+    )
+
+def _run_linkedin_frontend() -> tuple[int, int, int]:
+    return _run_linkedin_task(
+        "Frontend Developer",
+        LINKEDIN_TASKS["Frontend Developer"],
+    )
+
+
+# ── Indeed ─────────────────────────────────────────────────────────────────────
 
 def _run_indeed_jobs() -> tuple[int, int, int]:
     if not os.environ.get("APIFY_TOKEN"):
@@ -374,14 +411,17 @@ def _run_indeed_jobs() -> tuple[int, int, int]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 SCRAPERS = [
-    ("Unstop",       "Hackathons",   _run_unstop_hackathons),
-    ("Devfolio",     "Hackathons",   _run_devfolio),
-    ("Devpost",      "Hackathons",   _run_devpost),
-    ("HackerEarth",  "Hackathons",   _run_hackerearth),
-    ("Unstop",       "Internships",  _run_unstop_internships),
-    ("Buddy4Study",  "Scholarships", _run_buddy4study),
-    ("LinkedIn",     "Jobs",         _run_linkedin_jobs),
-    ("Indeed",       "Jobs",         _run_indeed_jobs),
+    ("Unstop",                       "Hackathons",   _run_unstop_hackathons),
+    ("Devfolio",                     "Hackathons",   _run_devfolio),
+    ("Devpost",                      "Hackathons",   _run_devpost),
+    ("HackerEarth",                  "Hackathons",   _run_hackerearth),
+    ("Unstop",                       "Internships",  _run_unstop_internships),
+    ("Buddy4Study",                  "Scholarships", _run_buddy4study),
+    ("LinkedIn (Software Engineer)", "Jobs",         _run_linkedin_software_engineer),
+    ("LinkedIn (Full Stack Dev)",    "Jobs",         _run_linkedin_fullstack),
+    ("LinkedIn (Data Analyst)",      "Jobs",         _run_linkedin_data_analyst),
+    ("LinkedIn (Frontend Dev)",      "Jobs",         _run_linkedin_frontend),
+    ("Indeed",                       "Jobs",         _run_indeed_jobs),
 ]
 
 
@@ -416,7 +456,6 @@ def run_all_scrapers() -> None:
     start = datetime.now()
     _banner(f"RUN #{_run_count}   {ts}")
 
-    # Pre-populate all categories so every row always appears in the summary
     category_totals: dict[str, dict] = {}
     for _, cat, _ in SCRAPERS:
         if cat not in category_totals:
@@ -459,18 +498,17 @@ def run_all_scrapers() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    _banner("xShare Scheduler  v5")
+    _banner("xShare Scheduler  v6")
     print()
     print("  Schedule:  every 6 hours")
     print("  Sources:   Unstop · Devfolio · Devpost · HackerEarth")
     print("             Unstop Internships · Buddy4Study Scholarships")
-    print("             LinkedIn Jobs · Indeed Jobs  (Apify)")
+    print("             LinkedIn Jobs (4 roles) · Indeed Jobs  (Apify)")
     print()
     print("  Timezone:  Asia/Kolkata")
 
     _check_env()
 
-    # Run once immediately on startup
     run_all_scrapers()
 
     scheduler = BlockingScheduler(timezone="Asia/Kolkata")
